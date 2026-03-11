@@ -29,7 +29,7 @@ import isaaclab.sim as sim_utils
 ROUGH_GAME = TerrainGeneratorCfg(
     class_type=BetterTerrainGenerator,
     seed=0,
-    size=(12.0, 12.0),
+    size=(10.0, 10.0),
     border_width=65.0,
     num_rows=10,
     num_cols=20,
@@ -49,9 +49,9 @@ ROUGH_GAME = TerrainGeneratorCfg(
         ),
         "ring": MeshFloatingRingTerrainCfg(
             proportion=0.20,
-            ring_height_range=(0.1, 0.2),
+            ring_height_range=(0.0, 0.1),
             ring_width_range=(0.3, 0.5),
-            ring_thickness=0.4,
+            ring_thickness=0.2,
             platform_width=6.0,
         ),
         "star": MeshStarTerrainCfg(
@@ -59,6 +59,11 @@ ROUGH_GAME = TerrainGeneratorCfg(
             num_bars=3,
             bar_width_range=(0.8, 1.2),
             bar_height_range=(0.2, 0.8),
+            platform_width=6.0,
+        ),
+        "pit": MeshPitTerrainCfg(
+            proportion=0.20,
+            pit_depth_range=(0.1, 0.2),
             platform_width=6.0,
         ),
     },

@@ -40,6 +40,12 @@ observation:
   # priv:
     root_linvel_b:    {yaw_only: true}
     root_angvel_b:    {}
+    feet_height_map: {
+      feet_names: .*_foot,
+      nomial_height: 0.3,
+      clamp_range: [-1., 1.],
+      flatten: true,
+    }
   extero:
     height_scan: {
       x_range: [-1.2, 1.2],
@@ -51,7 +57,7 @@ observation:
 reward:
   loco:
     game.chase_distance:      {weight: 2.0}
-    game.chase_velocity:      {weight: 1.0}
+    game.chase_velocity:      {weight: 2.0}
     game.evade_distance:      {weight: 2.0}
     game.target_in_sight:     {weight: 1.0}
     game.caught_reward:       {weight: 50.0}

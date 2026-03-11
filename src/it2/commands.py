@@ -186,12 +186,12 @@ class chase_velocity(Reward[Game]):
         self.asset = self.command_manager.asset
 
     def compute(self) -> tuple[torch.Tensor, torch.Tensor]:
-        is_active = torch.arange(self.num_envs, device=self.device) % 2 == 0
+        is_chaser = self.command_manager.role[:, None] == 0
         direction = normalize(self.command_manager.target_diff[:, :2])
         velocity = self.asset.data.root_link_lin_vel_w[:, :2]
         rew = torch.sum(direction * velocity, dim=1, keepdim=True)
         rew = torch.where(rew > 0, rew.log1p(), rew)
-        return rew.reshape(self.num_envs, 1), is_active.reshape(self.num_envs, 1)
+        return rew.reshape(self.num_envs, 1), is_chaser.reshape(self.num_envs, 1)
 
 
 class evade_distance(Reward[Game]):

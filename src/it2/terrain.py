@@ -18,6 +18,7 @@ from isaaclab.terrains import (
     MeshRailsTerrainCfg,
     MeshFloatingRingTerrainCfg,
     MeshStarTerrainCfg,
+    MeshBoxTerrainCfg,
     height_field,
     FlatPatchSamplingCfg
 )
@@ -48,7 +49,7 @@ ROUGH_GAME = TerrainGeneratorCfg(
             platform_width=6.0,
         ),
         "ring": MeshFloatingRingTerrainCfg(
-            proportion=0.20,
+            proportion=0.10,
             ring_height_range=(0.0, 0.1),
             ring_width_range=(0.3, 0.5),
             ring_thickness=0.2,
@@ -62,10 +63,16 @@ ROUGH_GAME = TerrainGeneratorCfg(
             platform_width=6.0,
         ),
         "pit": MeshPitTerrainCfg(
-            proportion=0.20,
+            proportion=0.10,
             pit_depth_range=(0.1, 0.2),
             platform_width=6.0,
         ),
+        "grid": MeshRandomGridTerrainCfg(
+            proportion=0.20,
+            grid_width=0.45,
+            grid_height_range=(0.02, 0.05),
+            platform_width=2.0,
+        )
     },
 )
 

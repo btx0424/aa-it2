@@ -189,6 +189,23 @@ class chase_velocity(Reward[Game]):
         return rew.reshape(self.num_envs, 1), is_chaser.reshape(self.num_envs, 1)
 
 
+class evade_velocity(Reward[Game]):
+    namespace = "game"
+
+    def __init__(self, env, weight: float, enabled: bool = True):
+        super().__init__(env, weight, enabled)
+        self.asset = self.command_manager.asset
+
+    def compute(self) -> tuple[torch.Tensor, torch.Tensor]:
+        is_evader = self.command_manager.role[:, None] == 1
+        direction = normalize(self.command_manager.target_diff[:, :2])
+        velocity = self.asset.data.root_link_lin_vel_w[:, :2]
+        # reward moving away from the chaser (negative projection of velocity on diff)
+        rew = -torch.sum(direction * velocity, dim=1, keepdim=True)
+        rew = torch.where(rew > 0, rew.log1p(), rew)
+        return rew.reshape(self.num_envs, 1), is_evader.reshape(self.num_envs, 1)
+
+
 class evade_distance_change(Reward[Game]):
     namespace = "game"
 

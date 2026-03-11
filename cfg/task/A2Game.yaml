@@ -56,8 +56,9 @@ observation:
 
 reward:
   loco:
-    game.chase_distance:      {weight: 2.0}
+    game.chase_distance_change: {weight: 8.0}
     game.chase_velocity:      {weight: 2.0}
+    game.evade_distance_change: {weight: 8.0}
     game.evade_distance:      {weight: 2.0}
     game.target_in_sight:     {weight: 1.0}
     game.caught_reward:       {weight: 50.0}

@@ -46,6 +46,8 @@ class Game(Command):
             self.role = torch.arange(self.num_envs) % 2
             self.target_caught_time = torch.zeros(self.num_envs, 1)
             self.is_standing_env = torch.zeros(self.num_envs, 1, dtype=bool)
+            self.last_distance = torch.zeros(self.num_envs, 1)
+            self.distance_change = torch.zeros(self.num_envs, 1)
 
         if self.env.sim.has_gui() and self.env.backend == "isaac":
             self.marker = self.scene.create_arrow_marker(
@@ -128,7 +130,12 @@ class Game(Command):
             1,
         ).reshape(self.num_envs, 3)
         self.target_diff = self.target_pos_w - self.asset.data.root_pos_w
-        self.distance = self.target_diff[:, :2].norm(dim=-1, keepdim=True)
+        
+        distance = self.target_diff[:, :2].norm(dim=-1, keepdim=True)
+        self.distance_change = distance - self.last_distance
+        self.last_distance = distance.clone()
+        self.distance = distance
+
         self.target_caught = self.distance < 0.8
         self.target_caught_time = torch.where(
             self.target_caught,
@@ -157,25 +164,13 @@ class Game(Command):
         )
 
 
-class chase_distance(Reward[Game]):
+class chase_distance_change(Reward[Game]):
     namespace = "game"
 
-    def __init__(self, env, weight: float, enabled: bool = True):
-        super().__init__(env, weight, enabled)
-        self.last_distance = torch.zeros(self.num_envs, 1, device=self.device)
-        self.distance_change = torch.zeros(self.num_envs, 1, device=self.device)
-
-    def update(self):
-        self.distance_change = self.command_manager.distance - self.last_distance
-        self.last_distance = self.command_manager.distance
-
     def compute(self) -> tuple[torch.Tensor, torch.Tensor]:
-        rew = torch.where(
-            self.command_manager.role[:, None] == 0,
-            -self.distance_change,  # closer is better for chaser
-            self.distance_change,  # further is better for evader
-        )
-        return rew.reshape(self.num_envs, 1)
+        is_chaser = self.command_manager.role[:, None] == 0
+        rew = -self.command_manager.distance_change
+        return rew.reshape(self.num_envs, 1), is_chaser.reshape(self.num_envs, 1)
 
 
 class chase_velocity(Reward[Game]):
@@ -192,6 +187,15 @@ class chase_velocity(Reward[Game]):
         rew = torch.sum(direction * velocity, dim=1, keepdim=True)
         rew = torch.where(rew > 0, rew.log1p(), rew)
         return rew.reshape(self.num_envs, 1), is_chaser.reshape(self.num_envs, 1)
+
+
+class evade_distance_change(Reward[Game]):
+    namespace = "game"
+
+    def compute(self) -> tuple[torch.Tensor, torch.Tensor]:
+        is_evader = self.command_manager.role[:, None] == 1
+        rew = self.command_manager.distance_change
+        return rew.reshape(self.num_envs, 1), is_evader.reshape(self.num_envs, 1)
 
 
 class evade_distance(Reward[Game]):
@@ -252,7 +256,7 @@ class stall_penalty(Reward[Game]):
         )
         rel_speed = rel_vel_vec.norm(dim=-1, keepdim=True)
 
-        near = dist < 1.0
+        near = dist < self.command_manager.catch_radius * 2.0
         slow = rel_speed < 0.1
         stall = (near & slow & is_chaser).float()
 

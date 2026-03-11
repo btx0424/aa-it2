@@ -68,12 +68,11 @@ class Game(Command):
     @property
     def command(self):
         arange = torch.arange(self.num_envs, device=self.device)
+        quat = self.asset.data.root_link_quat_w
         return torch.cat(
             [
-                quat_rotate_inverse(self.asset.data.root_link_quat_w, self.target_diff),
-                quat_rotate_inverse(
-                    self.asset.data.root_link_quat_w, self.target_lin_vel_w
-                ),
+                quat_rotate_inverse(quat, self.target_diff),
+                quat_rotate_inverse(quat, self.target_lin_vel_w),
                 (arange % 2 == 0).reshape(self.num_envs, 1),
                 (arange % 2 == 1).reshape(self.num_envs, 1),
             ],
@@ -233,6 +232,32 @@ class caught_reward(Reward[Game]):
     def compute(self) -> torch.Tensor:
         caught = self.command_manager.target_caught.float()
         return torch.where(self.command_manager.role[:, None] == 0, caught, -caught)
+
+
+class stall_penalty(Reward[Game]):
+    namespace = "game"
+
+    def __init__(self, env, weight: float, enabled: bool = True):
+        super().__init__(env, weight, enabled)
+        self.asset = self.command_manager.asset
+
+    def compute(self) -> tuple[torch.Tensor, torch.Tensor]:
+        # only penalize chaser (role == 0)
+        is_chaser = self.command_manager.role[:, None] == 0
+
+        dist = self.command_manager.distance  # [num_envs, 1]
+        rel_vel_vec = (
+            self.command_manager.target_lin_vel_w[:, :2]
+            - self.asset.data.root_link_lin_vel_w[:, :2]
+        )
+        rel_speed = rel_vel_vec.norm(dim=-1, keepdim=True)
+
+        near = dist < 1.0
+        slow = rel_speed < 0.1
+        stall = (near & slow & is_chaser).float()
+
+        rew = -stall
+        return rew.reshape(self.num_envs, 1), is_chaser.reshape(self.num_envs, 1)
 
 
 class both_terminate(Termination[Game]):

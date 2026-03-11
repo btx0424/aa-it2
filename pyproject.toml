@@ -1,0 +1,20 @@
+[build-system]
+requires = ["setuptools>=61.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "it2"
+version = "0.1.0"
+requires-python = ">=3.11,<3.13"
+dependencies = [
+    "active_adaptation",
+]
+
+[project.entry-points."active_adaptation.projects"]
+it2 = "it2"
+
+[project.entry-points."active_adaptation.learning"]
+it2 = "it2_learning"
+
+[tool.setuptools.package-data]
+"*" = ["**/*"]

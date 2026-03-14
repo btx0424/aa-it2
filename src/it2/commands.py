@@ -1,7 +1,7 @@
 import torch
 import warp as wp
 
-from active_adaptation.envs.mdp.base import Command, Reward, Termination
+from active_adaptation.envs.mdp import Command, Reward, Termination
 from active_adaptation.utils.math import (
     quat_rotate_inverse,
     quat_rotate,
@@ -21,12 +21,16 @@ class Game(Command):
         self.catch_radius = catch_radius
 
         from active_adaptation.envs.terrain import BetterTerrainImporter, BetterTerrainGenerator
-        from active_adaptation.envs.adapters import IsaacSceneAdapter
+        from active_adaptation.envs.backends.isaac import IsaacSceneAdapter
         from it2.utils import find_flat_patches
 
         self.scene: IsaacSceneAdapter = self.env.scene
         self.terrain_importer: BetterTerrainImporter = self.scene.terrain
         self.terrain_generator: BetterTerrainGenerator = self.terrain_importer.terrain_generator
+        if self.terrain_importer.cfg.terrain_type == "generator":
+            self.origins = self.terrain_importer.terrain_origins.reshape(-1, 3)
+        else:
+            self.origins = self.scene.env_origins
 
         sub_terrain_size = self.terrain_generator.cfg.size
         half_x = self.terrain_generator.num_rows * sub_terrain_size[0] / 2
@@ -96,9 +100,9 @@ class Game(Command):
         init_root_state = self.init_root_state[env_ids]
         
         idx = torch.randint(
-            0, len(self._origins), (num_envs,), device=self.device
+            0, len(self.origins), (num_envs,), device=self.device
         )
-        origins = self._origins[idx]
+        origins = self.origins[idx]
 
         init_pos = origins[chase]
         angle = torch.rand(len(init_pos), device=self.device) * 2 * torch.pi
@@ -167,7 +171,7 @@ class Game(Command):
 class chase_distance_change(Reward[Game]):
     namespace = "game"
 
-    def compute(self) -> tuple[torch.Tensor, torch.Tensor]:
+    def _compute(self) -> tuple[torch.Tensor, torch.Tensor]:
         is_chaser = self.command_manager.role[:, None] == 0
         rew = -self.command_manager.distance_change
         return rew.reshape(self.num_envs, 1), is_chaser.reshape(self.num_envs, 1)
@@ -180,7 +184,7 @@ class chase_velocity(Reward[Game]):
         super().__init__(env, weight, enabled)
         self.asset = self.command_manager.asset
 
-    def compute(self) -> tuple[torch.Tensor, torch.Tensor]:
+    def _compute(self) -> tuple[torch.Tensor, torch.Tensor]:
         is_chaser = self.command_manager.role[:, None] == 0
         direction = normalize(self.command_manager.target_diff[:, :2])
         velocity = self.asset.data.root_link_lin_vel_w[:, :2]
@@ -196,7 +200,7 @@ class evade_velocity(Reward[Game]):
         super().__init__(env, weight, enabled)
         self.asset = self.command_manager.asset
 
-    def compute(self) -> tuple[torch.Tensor, torch.Tensor]:
+    def _compute(self) -> tuple[torch.Tensor, torch.Tensor]:
         is_evader = self.command_manager.role[:, None] == 1
         direction = normalize(self.command_manager.target_diff[:, :2])
         velocity = self.asset.data.root_link_lin_vel_w[:, :2]
@@ -209,7 +213,7 @@ class evade_velocity(Reward[Game]):
 class evade_distance_change(Reward[Game]):
     namespace = "game"
 
-    def compute(self) -> tuple[torch.Tensor, torch.Tensor]:
+    def _compute(self) -> tuple[torch.Tensor, torch.Tensor]:
         is_evader = self.command_manager.role[:, None] == 1
         rew = self.command_manager.distance_change
         return rew.reshape(self.num_envs, 1), is_evader.reshape(self.num_envs, 1)
@@ -221,7 +225,7 @@ class evade_distance(Reward[Game]):
     def __init__(self, env, weight: float, enabled: bool = True):
         super().__init__(env, weight, enabled)
 
-    def compute(self) -> tuple[torch.Tensor, torch.Tensor]:
+    def _compute(self) -> tuple[torch.Tensor, torch.Tensor]:
         is_active = torch.arange(self.num_envs, device=self.device) % 2 == 1
         rew = 1 - torch.exp(-self.command_manager.distance * 0.5).reshape(
             self.num_envs, 1
@@ -236,7 +240,7 @@ class target_in_sight(Reward[Game]):
         super().__init__(env, weight, enabled)
         self.asset = self.command_manager.asset
 
-    def compute(self) -> torch.Tensor:
+    def _compute(self) -> torch.Tensor:
         forward_vec = quat_rotate(
             self.asset.data.root_link_quat_w,
             torch.tensor([1.0, 0.0, 0.0], device=self.device).expand(self.num_envs, 3),
@@ -250,7 +254,7 @@ class target_in_sight(Reward[Game]):
 class caught_reward(Reward[Game]):
     namespace = "game"
 
-    def compute(self) -> torch.Tensor:
+    def _compute(self) -> torch.Tensor:
         caught = self.command_manager.target_caught.float()
         return torch.where(self.command_manager.role[:, None] == 0, caught, -caught)
 
@@ -262,7 +266,7 @@ class stall_penalty(Reward[Game]):
         super().__init__(env, weight, enabled)
         self.asset = self.command_manager.asset
 
-    def compute(self) -> tuple[torch.Tensor, torch.Tensor]:
+    def _compute(self) -> tuple[torch.Tensor, torch.Tensor]:
         # only penalize chaser (role == 0)
         is_chaser = self.command_manager.role[:, None] == 0
 

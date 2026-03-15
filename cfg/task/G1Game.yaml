@@ -1,0 +1,125 @@
+# @package task
+name: A2Game
+
+viewer:
+  resolution: [1280, 720]
+  lookat: [0., 0., 0.]
+  eye: [4.0, 4.0, 4.0]
+
+robot:
+  name: g1_waist_unlocked
+terrain: game
+
+# common
+num_envs: 4096
+max_episode_length: 1000
+
+sim:
+  step_dt: 0.02
+  isaac_physics_dt: 0.005
+  mujoco_physics_dt: 0.002
+
+input:
+  action:
+    _target_: JointPosition
+    action_scaling: 
+      .*hip_pitch.*: 0.548
+      .*hip_roll.*: 0.351
+      .*hip_yaw.*: 0.548
+      .*knee.*: 0.351
+      waist_yaw_joint: 0.541
+      waist_roll_joint: 0.439
+      waist_pitch_joint: 0.439
+      .*ankle.*: 0.439
+      .*shoulder.*: 0.173
+      .*elbow_joint: 0.173
+      # .*wrist_roll.*: 0.173
+      # .*wrist_pitch.*: 0.293
+      # .*wrist_yaw.*: 0.293
+    max_delay: 1
+    alpha_range: [0.8, 1.0]
+
+command:
+  _target_: Game
+  catch_radius: 0.8
+
+observation:
+  policy:
+    command:  {}
+    gravity_multistep: {steps: 4, noise_std: 0.05}
+    joint_pos_multistep: {steps: 4, noise_std: 0.05}
+    joint_vel_multistep: {steps: 4, noise_std: 0.2}
+    prev_actions: {steps: 2}
+  # priv:
+    root_linvel_b:    {yaw_only: true}
+    root_angvel_b:    {}
+    feet_height_map: {
+      feet_names: .*_ankle_roll_link,
+      nomial_height: 0.3,
+      clamp_range: [-1., 1.],
+      flatten: true,
+    }
+  extero:
+    height_scan: {
+      x_range: [-1.2, 1.2],
+      y_range: [-1.0, 1.0],
+      resolution: [0.1, 0.1],
+      flatten: false,
+    }
+
+reward:
+  loco:
+    game.chase_distance_change: {weight: 8.0}
+    game.chase_velocity:      {weight: 2.0}
+    game.evade_distance_change: {weight: 8.0}
+    game.evade_velocity:      {weight: 2.0}
+    game.evade_distance:      {weight: 2.0}
+    game.target_in_sight:     {weight: 1.0}
+    game.caught_reward:       {weight: 50.0}
+    game.stall_penalty:       {weight: 1.0}
+    angvel_xy_l2:       {weight: 0.02}
+    linvel_z_l2:        {weight: 2.0}
+    single_foot_contact: {weight: 0.75, body_names: .*ankle_roll_link, margin: 0.1}
+  regularization:
+    energy_l1:          {weight: 0.0005}
+    joint_vel_l2:       {weight: 1.0e-3, joint_names: [.*shoulder.*]}
+    joint_acc_l2:       {weight: 2.5e-7}
+    joint_torques_l2:   {weight: 2.0e-4}
+    survival:           {weight: 1.0}
+    action_rate_l2:     {weight: 0.01}
+    action_rate2_l2:    {weight: 0.002}
+    feet_air_time:      {weight: 0.4, body_names: .*_ankle_roll_link, thres: 0.5}
+    feet_sliding:       {weight: 0.2, body_names: .*_ankle_roll_link}
+  debug:
+    _enabled_: false
+    feet_contact_count: {weight: 1.0, body_names: .*_ankle_roll_link}
+    # feet_swing_height:  {weight: 0.1, target_height: 0.1}
+
+termination:
+  crash: 
+    body_names_expr:
+    - "pelvis"
+    - "torso_link"
+    - ".*_hip_.*_link"
+    - ".*shoulder_.*_link"
+    - ".*(wrist|elbow).*"
+  fall_over: {xy_thres: 0.9}
+  game.caught_termination: {}
+  game.both_terminate: {}
+
+randomization:
+  perturb_body_mass:
+    .*: [0.9, 1.1]
+  perturb_body_materials:
+    body_names: .*_ankle_roll_link
+    static_friction_range:  [0.5, 3.0]
+    dynamic_friction_range: [0.5, 3.0]
+    restitution_range:      [0.0, 0.5]
+  motor_params:
+    stiffness_range:
+      .*: [0.8, 1.1]
+    damping_range:
+      .*: [0.8, 1.1]
+  reset_joint_states_scale:
+    pos_scales:
+      .*: [0.8, 1.2]

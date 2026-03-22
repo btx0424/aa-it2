@@ -25,6 +25,9 @@ input:
     action_scaling: {.*_joint: 0.5}
     max_delay: 1
     alpha_range: [0.5, 1.0]
+  future_traj:
+    _target_: Marker
+    body_frame: true
 
 command:
   _target_: Game
@@ -53,6 +56,8 @@ observation:
       resolution: [0.1, 0.1],
       flatten: false,
     }
+  root_state_w:
+    root_state_w: {}
 
 reward:
   loco:

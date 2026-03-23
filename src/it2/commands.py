@@ -53,6 +53,8 @@ class Game(Command):
             self.last_distance = torch.zeros(self.num_envs, 1)
             self.distance_change = torch.zeros(self.num_envs, 1)
 
+            self.distance_traveled = torch.zeros(self.num_envs, 1)
+
         if self.env.sim.has_gui() and self.env.backend == "isaac":
             self.marker = self.scene.create_arrow_marker(
                 prim_path="/Visuals/Command/arrow",
@@ -95,6 +97,9 @@ class Game(Command):
         )
 
     def sample_init(self, env_ids: torch.Tensor) -> torch.Tensor:
+        self.env.extra["curriculum/distance_traveled"] = self.distance_traveled.mean()
+        self.distance_traveled[env_ids] = 0.0
+
         num_envs = len(env_ids)
         chase = env_ids % 2 == 0
         init_root_state = self.init_root_state[env_ids]
@@ -146,6 +151,10 @@ class Game(Command):
             self.target_caught_time + self.env.step_dt,
             torch.zeros_like(self.target_caught_time),
         )
+
+        # debugging diagnostics
+        speed = self.asset.data.root_link_lin_vel_w[:, :2].norm(dim=-1, keepdim=True)
+        self.distance_traveled += speed * self.env.step_dt
 
     def debug_draw(self):
         self.env.debug_draw.vector(

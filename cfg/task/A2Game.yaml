@@ -8,7 +8,7 @@ viewer:
 
 robot:
   name: unitree_a2
-terrain: game_323
+terrain: game_410
 
 # common
 num_envs: 4096

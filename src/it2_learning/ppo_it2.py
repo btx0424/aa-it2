@@ -102,10 +102,12 @@ class PPOPolicy(TensorDictModuleBase):
         extero_shape = fake_input["extero"].shape[-3:] # (C, H, W)
         self.action_dim = env.action_manager.action_dim
 
+        self.cmd_norm = VecNorm(cmd_shape, cmd_shape, 1.0)
         self.mlp_norm = VecNorm(proprio_shape, proprio_shape, 1.0)
         self.cnn_norm = VecNorm(extero_shape, [extero_shape[0], 1, 1], 1.0)
         
         self.vecnorm = TDSeq(
+            TDMod(self.cmd_norm, [CMD_KEY], ["_cmd_normed"]),
             TDMod(self.mlp_norm, [OBS_KEY], ["_obs_normed"]),
             TDMod(self.cnn_norm, ["extero"], ["_extero_normed"]),
         ).to(self.device)
@@ -247,18 +249,20 @@ class PPOPolicy(TensorDictModuleBase):
             tensordict_ = self.actor(tensordict_)
             dist = IndependentNormal(tensordict_["loc"], tensordict_["scale"])
             log_probs_after = dist.log_prob(action)
-            pg_loss_after = log_probs_after.reshape_as(adv_unnormalized) * adv_unnormalized
-            pg_loss_before = log_probs_before.reshape_as(adv_unnormalized) * adv_unnormalized
+            log_ratio = (log_probs_after - log_probs_before).reshape_as(adv_unnormalized)
+            policy_gain = log_ratio * adv_unnormalized
+            weighted_ratio = log_ratio.exp() * adv_unnormalized
                 
         infos = pytree.tree_map(lambda *xs: sum(xs).item() / len(xs), *infos)
         infos["actor/lr"] = self.opt.param_groups[0]["lr"]
-        infos["actor/pg_loss_raw_after"] = pg_loss_after.mean().item()
-        infos["actor/pg_loss_raw_before"] = pg_loss_before.mean().item()
+        infos["actor/policy_gain"] = policy_gain.mean().item()
+        infos["actor/weighted_ratio"] = weighted_ratio.mean().item()
 
         infos["critic/value_mean"] = tensordict["ret"].mean().item()
         infos["critic/value_var"] = tensordict["ret"].var().item()
         infos["critic/neg_rew_ratio"] = (tensordict[REWARD_KEY].sum(-1) <= 0.).float().mean().item()
         if aa.is_distributed():
+            self.cmd_norm.synchronize(mode="broadcast")
             self.mlp_norm.synchronize(mode="broadcast")
             self.cnn_norm.synchronize(mode="broadcast")
         return dict(sorted(infos.items()))

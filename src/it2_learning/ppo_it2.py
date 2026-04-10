@@ -44,11 +44,10 @@ from collections import OrderedDict
 from active_adaptation.learning.modules import (
     IndependentNormal,
     VecNorm,
-    FiLM,
-    MLP
 )
-from active_adaptation.learning.utils.opt import OptimizerGroup
+from active_adaptation.learning.utils.opt import MuonAdamWWrapper
 from active_adaptation.learning.ppo.common import *
+from it2_learning.encoders import EncoderOne
 
 import active_adaptation as aa
 import torch.distributed as distr
@@ -62,10 +61,10 @@ class PPOConfig:
     ppo_epochs: int = 4
     num_minibatches: int = 4
     lr: float = 5e-4
-    desired_kl: Union[float, None] = None
     clip_param: float = 0.2
     entropy_coef: float = 0.002
 
+    share_encoder: bool = False
     muon: bool = False
     compile: bool = False
     use_ddp: bool = True
@@ -74,21 +73,6 @@ class PPOConfig:
 
 cs = ConfigStore.instance()
 cs.store("ppo_it2", node=PPOConfig, group="algo")
-
-
-class MixedEncoder(nn.Module):
-    def __init__(
-        self,
-        cmd_shape: torch.Size,
-        proprio_shape: torch.Size,
-        conditioning: Literal["concat", "film"] = "concat",
-        # extero_shape: torch.Size, # TODO: add extero encoder
-    ):
-        super().__init__()
-
-    
-    def forward(self, cmd_inp: torch.Tensor, proprio_inp: torch.Tensor):
-        pass
 
 
 class PPOPolicy(TensorDictModuleBase):
@@ -108,14 +92,14 @@ class PPOPolicy(TensorDictModuleBase):
 
         self.entropy_coef = self.cfg.entropy_coef
         self.max_grad_norm = 1.0
-        self.desired_kl = self.cfg.desired_kl
         self.clip_param = self.cfg.clip_param
         self.critic_loss_fn = nn.MSELoss(reduction="none")
         self.gae = GAE(0.99, 0.95)
         
         fake_input = observation_spec.zero()
-        proprio_shape = fake_input[OBS_KEY].shape[-1]
-        extero_shape = fake_input["extero"].shape[-3:]
+        cmd_shape = fake_input[CMD_KEY].shape[-1:] # (D,)
+        proprio_shape = fake_input[OBS_KEY].shape[-1:] # (D,)
+        extero_shape = fake_input["extero"].shape[-3:] # (C, H, W)
         self.action_dim = env.action_manager.action_dim
 
         self.mlp_norm = VecNorm(proprio_shape, proprio_shape, 1.0)
@@ -132,13 +116,27 @@ class PPOPolicy(TensorDictModuleBase):
         self.act_transform = env.input_managers[ACTION_KEY].symmetry_transform().to(self.device)
 
         _actor = nn.Sequential(ResidualFC(256, 256), Actor(self.action_dim))
-        actor_module = TDSeq(
-            TDMod(
-                MixedEncoder(proprio_shape, extero_shape),
-                ["_obs_normed", "_extero_normed"], ["actor_feature"]
-            ),
-            TDMod(_actor, ["actor_feature"], ["loc", "scale"])
-        )
+        _critic = nn.Sequential(ResidualFC(256, 256), nn.LazyLinear(1))
+
+        def make_encoder(out_key: str):
+            return TDMod(
+                EncoderOne(cmd_shape, proprio_shape, extero_shape),
+                [CMD_KEY, "_obs_normed", "_extero_normed"], [out_key]
+            )
+        if self.cfg.share_encoder:
+            self.encoder = make_encoder("_shared_feature").to(self.device)
+            self.actor_encoder = self.encoder
+            actor_module = TDMod(_actor, ["_shared_feature"], ["loc", "scale"])
+            critic_module = TDMod(_critic, ["_shared_feature"], ["state_value"])
+        else:
+            self.actor_encoder = make_encoder("_actor_feature")
+            self.encoder = TDSeq(
+                self.actor_encoder,
+                make_encoder("_critic_feature"),
+            ).to(self.device)
+            actor_module = TDMod(_actor, ["_actor_feature"], ["loc", "scale"])
+            critic_module = TDMod(_critic, ["_critic_feature"], ["state_value"])
+
         self.actor: ProbabilisticActor = ProbabilisticActor(
             module=actor_module,
             in_keys=["loc", "scale"],
@@ -146,17 +144,11 @@ class PPOPolicy(TensorDictModuleBase):
             distribution_class=IndependentNormal,
             return_log_prob=True
         ).to(self.device)
-        
-        _critic = nn.Sequential(ResidualFC(256, 256), nn.LazyLinear(1))
-        self.critic = TDSeq(
-            TDMod(
-                MixedEncoder(proprio_shape, extero_shape),
-                ["_obs_normed", "_extero_normed"], ["critic_feature"]
-            ),
-            TDMod(_critic, ["critic_feature"], ["state_value"])
-        ).to(self.device)
+
+        self.critic = critic_module.to(self.device)
 
         self.vecnorm(fake_input)
+        self.encoder(fake_input)
         self.actor(fake_input)
         self.critic(fake_input)
         
@@ -171,14 +163,19 @@ class PPOPolicy(TensorDictModuleBase):
                 nn.init.orthogonal_(module.actor_mean.weight, 0.01)
                 nn.init.constant_(module.actor_mean.bias, 0.)
         
+        self.encoder.apply(init_)
         self.actor.apply(init_)
         self.critic.apply(init_)
 
         if aa.is_distributed():
             if self.cfg.use_ddp:
-                self.actor = DDP(self.actor, device_ids=[aa.get_local_rank()])
-                self.critic = DDP(self.critic, device_ids=[aa.get_local_rank()])
+                local_rank = aa.get_local_rank()
+                self.encoder = DDP(self.encoder, device_ids=[local_rank])
+                self.actor = DDP(self.actor, device_ids=[local_rank])
+                self.critic = DDP(self.critic, device_ids=[local_rank])
             else:
+                for param in self.encoder.parameters():
+                    distr.broadcast(param, src=0)
                 for param in self.actor.parameters():
                     distr.broadcast(param, src=0)
                 for param in self.critic.parameters():
@@ -193,23 +190,16 @@ class PPOPolicy(TensorDictModuleBase):
             # self.update = CudaGraphModule(self.update)
     
     def _configure_optimizers(self):
-        def is_matrix_shaped(param: torch.Tensor) -> bool:
-            return param.dim() == 2
-
         if self.cfg.muon:
-            muon = torch.optim.Muon([
-                {"params": [p for p in self.actor.parameters() if is_matrix_shaped(p)]},
-                {"params": [p for p in self.critic.parameters() if is_matrix_shaped(p)]},
-            ], lr=self.cfg.lr, adjust_lr_fn="match_rms_adamw", weight_decay=0.01)
-
-            adamw = torch.optim.AdamW([
-                {"params": [p for p in self.actor.parameters() if not is_matrix_shaped(p)]},
-                {"params": [p for p in self.critic.parameters() if not is_matrix_shaped(p)]},
-            ], lr=self.cfg.lr, weight_decay=0.01)
-            self.opt = OptimizerGroup([muon, adamw])
+            self.opt = MuonAdamWWrapper(
+                [self.encoder, self.actor, self.critic],
+                lr=self.cfg.lr,
+                weight_decay=0.01
+            )
         else:
             self.opt = torch.optim.AdamW(
                 [
+                    {"params": self.encoder.parameters()},
                     {"params": self.actor.parameters()},
                     {"params": self.critic.parameters()},
                 ],
@@ -222,11 +212,14 @@ class PPOPolicy(TensorDictModuleBase):
 
     def get_rollout_policy(self, mode: str="train", critic: bool=False):
         if critic:
-            policy = TDSeq(self.vecnorm, self.actor, self.critic)
+            policy = TDSeq(self.vecnorm, self.encoder, self.actor, self.critic)
         else:
-            policy = TDSeq(self.vecnorm, self.actor)
+            if self.cfg.share_encoder:
+                policy = TDSeq(self.vecnorm, self.encoder, self.actor)
+            else:
+                policy = TDSeq(self.vecnorm, self.actor_encoder, self.actor)
         if self.cfg.compile:
-            policy = torch.compile(policy, fullgraph=True)
+            policy = torch.compile(policy)
         return policy
 
     @VecNorm.freeze()
@@ -245,19 +238,13 @@ class PPOPolicy(TensorDictModuleBase):
         for epoch in range(self.cfg.ppo_epochs):
             batch = make_batch(tensordict, self.cfg.num_minibatches)
             for minibatch in batch:
+                minibatch = self._augment_symmetry(minibatch)
                 infos.append(self.update(minibatch))
-                
-                if self.desired_kl is not None: # adaptive learning rate
-                    kl = infos[-1]["actor/kl"]
-                    actor_lr = self.opt.param_groups[0]["lr"]
-                    if kl > self.desired_kl * 2.0:
-                        actor_lr = max(1e-5, actor_lr / 1.5)
-                    elif kl < self.desired_kl / 2.0 and kl > 0.0:
-                        actor_lr = min(1e-2, actor_lr * 1.5)
-                    self.opt.param_groups[0]["lr"] = actor_lr
         
         with torch.no_grad():
-            tensordict_ = self.actor(tensordict.copy())
+            tensordict_ = tensordict.copy()
+            self.encoder(tensordict_)
+            tensordict_ = self.actor(tensordict_)
             dist = IndependentNormal(tensordict_["loc"], tensordict_["scale"])
             log_probs_after = dist.log_prob(action)
             pg_loss_after = log_probs_after.reshape_as(adv_unnormalized) * adv_unnormalized
@@ -287,8 +274,12 @@ class PPOPolicy(TensorDictModuleBase):
         keys = tensordict.keys(True, True)
         if not ("state_value" in keys and ("next", "state_value") in keys):
             with tensordict.view(-1) as tensordict_flat:
-                critic(self.vecnorm(tensordict_flat))
-                critic(self.vecnorm(tensordict_flat["next"]))
+                self.vecnorm(tensordict_flat)
+                self.encoder(tensordict_flat)
+                critic(tensordict_flat)
+                self.vecnorm(tensordict_flat["next"])
+                self.encoder(tensordict_flat["next"])
+                critic(tensordict_flat["next"])
 
         values = tensordict["state_value"]
         next_values = tensordict["next", "state_value"]
@@ -303,13 +294,11 @@ class PPOPolicy(TensorDictModuleBase):
         tensordict.set(adv_key, adv)
         tensordict.set(ret_key, ret)
         return tensordict
-
-    def _update(self, tensordict: TensorDict):
-        bsize = tensordict.shape[0]
-        loc_old, scale_old = tensordict["loc"], tensordict["scale"]
-
+    
+    def _augment_symmetry(self, tensordict: TensorDict) -> TensorDict:
         symmetry = tensordict.empty()
         symmetry[ACTION_KEY] = self.act_transform(tensordict[ACTION_KEY])
+        symmetry[CMD_KEY] = self.cmd_transform(tensordict[CMD_KEY])
         symmetry[OBS_KEY] = self.obs_transform(tensordict[OBS_KEY])
         symmetry["extero"] = self.extero_transform(tensordict["extero"])
         symmetry["action_log_prob"] = tensordict["action_log_prob"]
@@ -317,8 +306,13 @@ class PPOPolicy(TensorDictModuleBase):
         symmetry["ret"] = tensordict["ret"]
         symmetry["is_init"] = tensordict["is_init"]
         tensordict = torch.cat([tensordict.select(*symmetry.keys(True, True)), symmetry], dim=0)
-        
+        return tensordict
+
+    def _update(self, tensordict: TensorDict):
+        bsize = tensordict.shape[0]
+
         self.vecnorm(tensordict)
+        self.encoder(tensordict)
 
         valid = (~tensordict["is_init"])
         valid_cnt = valid.sum()
@@ -348,6 +342,9 @@ class PPOPolicy(TensorDictModuleBase):
         loss.backward()
 
         if aa.is_distributed() and not self.cfg.use_ddp:
+            for param in self.encoder.parameters():
+                distr.all_reduce(param.grad, op=distr.ReduceOp.SUM)
+                param.grad /= aa.get_world_size()
             for param in self.actor.parameters():
                 distr.all_reduce(param.grad, op=distr.ReduceOp.SUM)
                 param.grad /= aa.get_world_size()
@@ -355,6 +352,7 @@ class PPOPolicy(TensorDictModuleBase):
                 distr.all_reduce(param.grad, op=distr.ReduceOp.SUM)
                 param.grad /= aa.get_world_size()
 
+        encoder_grad_norm = nn.utils.clip_grad_norm_(self.encoder.parameters(), self.max_grad_norm)
         actor_grad_norm = nn.utils.clip_grad_norm_(self.actor.parameters(), self.max_grad_norm)
         critic_grad_norm = nn.utils.clip_grad_norm_(self.critic.parameters(), self.max_grad_norm)
         self.opt.step()
@@ -362,15 +360,15 @@ class PPOPolicy(TensorDictModuleBase):
         with torch.no_grad():
             explained_var = 1 - value_loss / b_returns[valid].var()
             clipfrac = ((ratio - 1.0).abs() > self.clip_param).float().mean()
-            loc, scale = dist.loc[:bsize], dist.scale[:bsize]
-            kl = IndependentNormal.kl(loc, scale, loc_old, scale_old).mean()
-            symmetry_loss = F.mse_loss(dist.mean[bsize:], self.act_transform(dist.mean[:bsize]))
+            approx_kl = ((ratio - 1.0) - log_ratio).mean()
+            symmetry_loss = F.mse_loss(dist.mean[bsize//2:], self.act_transform(dist.mean[:bsize//2]))
         return {
+            "encoder/grad_norm": encoder_grad_norm,
             "actor/policy_loss": policy_loss.detach(),
             "actor/entropy": entropy.detach(),
             "actor/grad_norm": actor_grad_norm,
             "actor/clamp_ratio": clipfrac,
-            "actor/kl": kl,
+            "actor/approx_kl": approx_kl,
             "actor/symmetry_loss": symmetry_loss.detach(),
             "critic/value_loss": value_loss.detach(),
             "critic/grad_norm": critic_grad_norm,

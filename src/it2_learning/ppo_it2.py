@@ -48,7 +48,7 @@ from active_adaptation.learning.modules import (
 )
 from active_adaptation.learning.utils.opt import MuonAdamWWrapper
 from active_adaptation.learning.ppo.common import *
-from it2_learning.encoders import EncoderOne
+from it2_learning.encoders import EncoderOne, EncoderTwo
 
 import active_adaptation as aa
 import torch.distributed as distr
@@ -65,6 +65,7 @@ class PPOConfig:
     clip_param: float = 0.2
     entropy_coef: float = 0.002
 
+    encoder_type: str = "one"
     share_encoder: bool = False
     muon: bool = False
     compile: bool = False
@@ -122,11 +123,17 @@ class PPOPolicy(TensorDictModuleBase):
         _actor = nn.Sequential(ResidualFC(256, 256), Actor(self.action_dim))
         _critic = nn.Sequential(ResidualFC(256, 256), nn.LazyLinear(1))
 
+        EncoderClass = {
+            "one": EncoderOne,
+            "two": EncoderTwo,
+        }[self.cfg.encoder_type]
+
         def make_encoder(out_key: str):
             return TDMod(
-                EncoderOne(cmd_shape, proprio_shape, extero_shape),
+                EncoderClass(cmd_shape, proprio_shape, extero_shape),
                 [CMD_KEY, "_obs_normed", "_extero_normed"], [out_key]
             )
+
         if self.cfg.share_encoder:
             self.encoder = make_encoder("_shared_feature").to(self.device)
             self.actor_encoder = self.encoder
@@ -206,10 +213,10 @@ class PPOPolicy(TensorDictModuleBase):
         self._scaler = torch.amp.GradScaler("cuda", enabled=self._amp_enabled)
 
         self.update = self._update
-        if self.cfg.compile and not aa.is_distributed():
-            # TODO: compile for multi-gpu training?
-            self.update = torch.compile(self.update, fullgraph=True)
-            # self.update = CudaGraphModule(self.update)
+        # if self.cfg.compile and not aa.is_distributed():
+        #     # TODO: compile for multi-gpu training?
+        #     self.update = torch.compile(self.update, fullgraph=True)
+        #     # self.update = CudaGraphModule(self.update)
     
     def _configure_optimizers(self):
         if self.cfg.muon:
@@ -255,7 +262,12 @@ class PPOPolicy(TensorDictModuleBase):
         action = tensordict[ACTION_KEY]
         adv_unnormalized = tensordict["adv"].clone()
         log_probs_before = tensordict["action_log_prob"]
-        tensordict["adv"] = normalize(tensordict["adv"], subtract_mean=True)
+        
+        adv = tensordict["adv"]
+        role = tensordict[CMD_KEY][:, :, -2].bool()
+        adv[role], std0 = normalize(adv[role], subtract_mean=True) # chaser
+        adv[~role], std1 = normalize(adv[~role], subtract_mean=True) # evader
+        tensordict["adv"] = adv
 
         for epoch in range(self.cfg.ppo_epochs):
             batch = make_batch(tensordict, self.cfg.num_minibatches)
@@ -274,6 +286,8 @@ class PPOPolicy(TensorDictModuleBase):
             weighted_ratio = log_ratio.exp() * adv_unnormalized
                 
         infos = pytree.tree_map(lambda *xs: sum(xs).item() / len(xs), *infos)
+        infos["curriculum/std_chaser"] = std0.mean().item()
+        infos["curriculum/std_evader"] = std1.mean().item()
         infos["actor/lr"] = self.opt.param_groups[0]["lr"]
         infos["actor/policy_gain"] = policy_gain.mean().item()
         infos["actor/weighted_ratio"] = weighted_ratio.mean().item()
@@ -441,7 +455,8 @@ class PPOPolicy(TensorDictModuleBase):
 
 
 def normalize(x: torch.Tensor, subtract_mean: bool=False):
+    std = x.std()
     if subtract_mean:
-        return (x - x.mean()) / x.std().clamp(1e-7)
+        return (x - x.mean()) / std.clamp(1e-7), std
     else:
-        return x  / x.std().clamp(1e-7)
+        return x  / std.clamp(1e-7), std

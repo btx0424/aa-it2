@@ -1,7 +1,7 @@
 import torch
 import torch.nn as nn
 from active_adaptation.learning.modules import MLP
-
+from typing import Type
 
 class EncoderOne(nn.Module):
     def __init__(
@@ -12,21 +12,22 @@ class EncoderOne(nn.Module):
         token_dim: int = 128,
         hidden_dim: int = 256,
         num_heads: int = 4,
+        activation: Type[nn.Module] = nn.SiLU,
     ):
         super().__init__()
         self.token_dim = token_dim
         self.hidden_dim = hidden_dim
         extero_channels = extero_shape[0] if len(extero_shape) == 3 else 1
 
-        self.cmd_mlp = MLP([cmd_shape[-1], 128, token_dim])
-        self.proprio_mlp = MLP([proprio_shape[-1], 256, token_dim])
+        self.cmd_mlp = MLP([cmd_shape[-1], 128, token_dim], activation=activation)
+        self.proprio_mlp = MLP([proprio_shape[-1], 256, token_dim], activation=activation)
         self.extero_mlp = nn.Sequential(
             nn.Conv2d(extero_channels, 32, kernel_size=3, stride=2, padding=1),
-            nn.SiLU(),
+            activation(),
             nn.Conv2d(32, 64, kernel_size=3, stride=2, padding=1),
-            nn.SiLU(),
+            activation(),
             nn.Conv2d(64, token_dim, kernel_size=3, stride=2, padding=1),
-            nn.SiLU(),
+            activation(),
             nn.AdaptiveAvgPool2d(1),
             nn.Flatten(start_dim=1),
         )
@@ -40,13 +41,13 @@ class EncoderOne(nn.Module):
         self.ffn = nn.Sequential(
             nn.LayerNorm(token_dim),
             nn.Linear(token_dim, hidden_dim),
-            nn.SiLU(),
+            activation(),
             nn.Linear(hidden_dim, token_dim),
         )
         self.out_proj = nn.Sequential(
             nn.LayerNorm(3 * token_dim),
             nn.Linear(3 * token_dim, hidden_dim),
-            nn.SiLU(),
+            activation(),
         )
 
     def forward(

@@ -1,3 +1,8 @@
+from __future__ import annotations
+
+import numpy as np
+import trimesh
+
 from isaaclab.terrains import (
     TerrainImporterCfg,
     HfTerrainBaseCfg,
@@ -21,13 +26,37 @@ from isaaclab.terrains import (
     MeshRepeatedCylindersTerrainCfg,
     MeshBoxTerrainCfg,
     height_field,
-    FlatPatchSamplingCfg
+    FlatPatchSamplingCfg,
+    SubTerrainBaseCfg,
 )
 from dataclasses import MISSING
 from active_adaptation import ROBOT_MODEL_DIR
 from active_adaptation.envs.terrain import BetterTerrainImporter, BetterTerrainGenerator
 
 import isaaclab.sim as sim_utils
+from isaaclab.utils import configclass
+from .terrain_funcs import curved_corridor_terrain as _curved_corridor_terrain
+
+
+def curved_corridor_terrain(
+    difficulty: float,
+    cfg: CurvedCorridorTerrainCfg
+) -> tuple[list[trimesh.Trimesh], np.ndarray]:
+    turn_radius = cfg.turn_radius_range[0] + difficulty * (cfg.turn_radius_range[1] - cfg.turn_radius_range[0])
+    mesh = _curved_corridor_terrain(cfg.size, turn_radius, cfg.wall_height, cfg.wall_thickness)
+    mesh.apply_translation([0.5 * cfg.size[0], 0.5 * cfg.size[1], 0.0])
+    meshes = [mesh]
+    origin = np.array([0.5 * cfg.size[0], 0.5 * cfg.size[1], 0.0])
+    return meshes, origin
+
+
+@configclass
+class CurvedCorridorTerrainCfg(SubTerrainBaseCfg):
+    function = curved_corridor_terrain
+    turn_radius_range: tuple[float, float] = (2.0, 3.0)
+    wall_height: float = 1.0
+    wall_thickness: float = 0.1
+
 
 ROUGH_GAME = TerrainGeneratorCfg(
     class_type=BetterTerrainGenerator,
@@ -148,12 +177,15 @@ ROUGH_GAME_410 = TerrainGeneratorCfg(
     use_cache=False,
     curriculum=False,
     sub_terrains={
-        "flat": MeshPlaneTerrainCfg(
+        "curved_corridor": CurvedCorridorTerrainCfg(
             proportion=0.10,
+            turn_radius_range=(1.6, 2.4),
+            wall_height=1.0,
+            wall_thickness=0.1,
         ),
         "gap": MeshGapTerrainCfg(
             proportion=0.15,
-            gap_width_range=(0.1, 0.4),
+            gap_width_range=(0.1, 0.5),
             platform_width=6.0,
         ),
         "ring": MeshFloatingRingTerrainCfg(
@@ -178,7 +210,7 @@ ROUGH_GAME_410 = TerrainGeneratorCfg(
         "grid": MeshRandomGridTerrainCfg(
             proportion=0.15,
             grid_width=0.45,
-            grid_height_range=(0.02, 0.05),
+            grid_height_range=(0.02, 0.08),
             platform_width=2.0,
         ),
         "stairs": MeshInvertedPyramidStairsTerrainCfg(
@@ -198,7 +230,7 @@ ROUGH_GAME_410 = TerrainGeneratorCfg(
         "cylinders": MeshRepeatedCylindersTerrainCfg(
             proportion=0.10,
             object_params_start=MeshRepeatedCylindersTerrainCfg.ObjectCfg(
-                num_objects=5,
+                num_objects=10,
                 height=0.2,
                 radius=0.1,
                 max_yx_angle=0.0,
@@ -206,10 +238,10 @@ ROUGH_GAME_410 = TerrainGeneratorCfg(
             object_params_end=MeshRepeatedCylindersTerrainCfg.ObjectCfg(
                 num_objects=20,
                 height=1.0,
-                radius=0.3,
+                radius=0.4,
                 max_yx_angle=30.0,
             ),
-            abs_height_noise=(0.0, 1.0),
+            abs_height_noise=(0.2, 1.0),
             platform_width=3.5,
             platform_height=0.1,
         ),

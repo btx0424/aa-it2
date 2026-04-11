@@ -26,6 +26,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 import warnings
 import torch.utils._pytree as pytree
+from contextlib import nullcontext
 
 from torchrl.data import Composite, TensorSpec
 from torchrl.modules import ProbabilisticActor
@@ -68,6 +69,7 @@ class PPOConfig:
     muon: bool = False
     compile: bool = False
     use_ddp: bool = True
+    use_amp: bool = False
 
     in_keys: Tuple[str, ...] = (CMD_KEY, OBS_KEY, "extero")
 
@@ -183,7 +185,25 @@ class PPOPolicy(TensorDictModuleBase):
                 for param in self.critic.parameters():
                     distr.broadcast(param, src=0)
             self.world_size = aa.get_world_size()
-        self._configure_optimizers()    
+        self._configure_optimizers()
+
+        _dev = torch.device(device) if not isinstance(device, torch.device) else device
+        if self.cfg.use_amp and _dev.type != "cuda":
+            warnings.warn(
+                "PPOConfig.use_amp=True requires a CUDA device; mixed precision disabled.",
+                UserWarning,
+                stacklevel=2,
+            )
+        self._amp_enabled = bool(self.cfg.use_amp) and _dev.type == "cuda"
+        if self._amp_enabled:
+            self._amp_dtype = (
+                torch.bfloat16
+                if torch.cuda.is_bf16_supported()
+                else torch.float16
+            )
+        else:
+            self._amp_dtype = torch.float32
+        self._scaler = torch.amp.GradScaler("cuda", enabled=self._amp_enabled)
 
         self.update = self._update
         if self.cfg.compile and not aa.is_distributed():
@@ -315,35 +335,46 @@ class PPOPolicy(TensorDictModuleBase):
     def _update(self, tensordict: TensorDict):
         bsize = tensordict.shape[0]
 
-        self.vecnorm(tensordict)
-        self.encoder(tensordict)
+        amp_ctx = (
+            torch.amp.autocast("cuda", dtype=self._amp_dtype, enabled=self._amp_enabled)
+            if self._amp_enabled
+            else nullcontext()
+        )
+        with amp_ctx:
+            self.vecnorm(tensordict)
+            self.encoder(tensordict)
 
-        valid = (~tensordict["is_init"])
-        valid_cnt = valid.sum()
-        
-        action_data = tensordict[ACTION_KEY]
-        log_probs_data = tensordict["action_log_prob"]
-        self.actor(tensordict)
-        dist = IndependentNormal(tensordict["loc"], tensordict["scale"])
-        log_probs = dist.log_prob(action_data)
-        entropy = (dist.entropy().reshape_as(valid) * valid).sum() / valid_cnt
+            valid = (~tensordict["is_init"])
+            valid_cnt = valid.sum()
 
-        adv = tensordict["adv"]
-        log_ratio = (log_probs - log_probs_data).unsqueeze(-1)
-        ratio = torch.exp(log_ratio)
-        surr1 = adv * ratio
-        surr2 = adv * ratio.clamp(1.-self.clip_param, 1.+self.clip_param)
-        policy_loss = - (torch.min(surr1, surr2).reshape_as(valid) * valid).sum() / valid_cnt
-        entropy_loss = - self.entropy_coef * entropy
+            action_data = tensordict[ACTION_KEY]
+            log_probs_data = tensordict["action_log_prob"]
+            self.actor(tensordict)
+            dist = IndependentNormal(tensordict["loc"], tensordict["scale"])
+            log_probs = dist.log_prob(action_data)
+            entropy = (dist.entropy().reshape_as(valid) * valid).sum() / valid_cnt
 
-        b_returns = tensordict["ret"]
-        values = self.critic(tensordict)["state_value"]
-        value_loss = self.critic_loss_fn(b_returns, values)
-        value_loss = (value_loss.reshape_as(valid) * valid).sum() / valid_cnt
+            adv = tensordict["adv"]
+            log_ratio = (log_probs - log_probs_data).unsqueeze(-1)
+            ratio = torch.exp(log_ratio)
+            surr1 = adv * ratio
+            surr2 = adv * ratio.clamp(1.-self.clip_param, 1.+self.clip_param)
+            policy_loss = - (torch.min(surr1, surr2).reshape_as(valid) * valid).sum() / valid_cnt
+            entropy_loss = - self.entropy_coef * entropy
 
-        loss = policy_loss + entropy_loss + value_loss
-        self.opt.zero_grad()
-        loss.backward()
+            b_returns = tensordict["ret"]
+            values = self.critic(tensordict)["state_value"]
+            value_loss = self.critic_loss_fn(b_returns, values)
+            value_loss = (value_loss.reshape_as(valid) * valid).sum() / valid_cnt
+
+            loss = policy_loss + entropy_loss + value_loss
+
+        self.opt.zero_grad(set_to_none=True)
+        if self._amp_enabled:
+            self._scaler.scale(loss).backward()
+            self._scaler.unscale_(self.opt)
+        else:
+            loss.backward()
 
         if aa.is_distributed() and not self.cfg.use_ddp:
             for param in self.encoder.parameters():
@@ -359,7 +390,12 @@ class PPOPolicy(TensorDictModuleBase):
         encoder_grad_norm = nn.utils.clip_grad_norm_(self.encoder.parameters(), self.max_grad_norm)
         actor_grad_norm = nn.utils.clip_grad_norm_(self.actor.parameters(), self.max_grad_norm)
         critic_grad_norm = nn.utils.clip_grad_norm_(self.critic.parameters(), self.max_grad_norm)
-        self.opt.step()
+
+        if self._amp_enabled:
+            self._scaler.step(self.opt)
+            self._scaler.update()
+        else:
+            self.opt.step()
         
         with torch.no_grad():
             explained_var = 1 - value_loss / b_returns[valid].var()

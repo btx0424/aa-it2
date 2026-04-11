@@ -283,6 +283,69 @@ def landing_stairs_terrain(
     return terrain_mesh
 
 
+def curved_corridor_terrain(
+    size: tuple[float, float],
+    turn_radius: float,
+    wall_height: float,
+    wall_thickness: float,
+) -> trimesh.Trimesh:
+    """Build an S-shaped corridor from two mirrored **180° turn** wall pieces.
+
+    Each piece is a thick **annular arc** (half of an annulus after a plane cut)
+    with **straight end caps**, forming a smooth U-like bend. One turn sits in the
+    ``+X`` half-space and the other is rotated and shifted into the ``-X``
+    half-space so the inner channel links in an **S** (two opposing bends).
+
+    A flat ground slab covers the full ``size`` footprint (top at ``z = 0``).
+
+    Args:
+        size: Full terrain size in X and Y as ``(size_x, size_y)`` (ground plane).
+        turn_radius: Inner radius of each curved wall (annulus ``r_min``).
+        wall_height: Vertical extent of the walls.
+        wall_thickness: Radial thickness of the annulus and width of the end-cap boxes.
+
+    Returns:
+        One ``trimesh.Trimesh`` combining both turn meshes and the ground.
+    """
+    size_x, size_y = size
+    meshes = []
+
+    def turn(radius: float) -> trimesh.Trimesh:
+        """Create a turn by cutting a cylinder."""
+        mesh: trimesh.Trimesh = trimesh.creation.annulus(
+            r_min=radius,
+            r_max=radius + wall_thickness,
+            height=wall_height,
+            sections=12,
+        )
+        # cut out the half of it
+        mesh = mesh.slice_plane([0., 0., 0.], [1., 0., 0.])
+        wall_length = radius * 2.0
+        # add walls at the ends
+        wall_a = trimesh.creation.box(extents=[wall_length, wall_thickness, wall_height])
+        wall_a.apply_translation([-0.5 * wall_length, radius + 0.5 * wall_thickness, 0.0])
+        wall_b = trimesh.creation.box(extents=[wall_length, wall_thickness, wall_height])
+        wall_b.apply_transform(trimesh.transformations.rotation_matrix(math.pi, [0.0, 0.0, 1.0]))
+        wall_b.apply_translation([-0.5 * wall_length, -radius - 0.5 * wall_thickness, 0.0])
+        return trimesh.util.concatenate([mesh, wall_a, wall_b])
+        
+    turn_a = turn(turn_radius)
+    turn_a.apply_translation([turn_radius, 0.5 * turn_radius, 0.5 * wall_height])
+    turn_b = turn(turn_radius)
+    turn_b.apply_transform(trimesh.transformations.rotation_matrix(math.pi, [0.0, 0.0, 1.0]))
+    turn_b.apply_translation([-turn_radius, -0.5 * turn_radius, 0.5 * wall_height])
+    meshes.append(turn_a)
+    meshes.append(turn_b)
+
+    ground = trimesh.creation.box(extents=[size_x, size_y, 0.2])
+    ground.apply_translation([0.0, 0.0, -0.1])
+    meshes.append(ground)
+
+    terrain_mesh = trimesh.util.concatenate(meshes)
+    terrain_mesh.merge_vertices()
+    return terrain_mesh
+
+
 if __name__ == "__main__":
     # Example: 10x10 terrain with a 3x3 central platform of height 0.5, 2-wide
     # sloped paths, and 0.3-high curbs on all four paths.
@@ -310,8 +373,17 @@ if __name__ == "__main__":
     # mesh.show()
 
     # Stairs: switchback (+X lower Y, −X upper Y); fixed step_run / stair_width.
-    mesh = landing_stairs_terrain(
+    # mesh = landing_stairs_terrain(
+    #     (10.0, 10.0),
+    #     platform_width=3.0,
+    # )
+    # mesh.show()
+
+    # Winding wall: 10x10 terrain, 0.35 m high wall 0.2 m thick.
+    mesh = curved_corridor_terrain(
         (10.0, 10.0),
-        platform_width=3.0,
+        turn_radius=2.4,
+        wall_height=1.0,
+        wall_thickness=0.1,
     )
     mesh.show()

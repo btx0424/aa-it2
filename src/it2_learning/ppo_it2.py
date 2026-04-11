@@ -47,7 +47,14 @@ from active_adaptation.learning.modules import (
     VecNorm,
 )
 from active_adaptation.learning.utils.opt import MuonAdamWWrapper
-from active_adaptation.learning.ppo.common import *
+from active_adaptation.learning.ppo.common import (
+    make_batch,
+    Actor,
+    Critic,
+    GAE,
+    ResidualFC,
+    CMD_KEY, OBS_KEY, ACTION_KEY, REWARD_KEY, TERM_KEY, DONE_KEY,
+)
 from it2_learning.encoders import EncoderOne, EncoderTwo
 
 import active_adaptation as aa
@@ -121,7 +128,7 @@ class PPOPolicy(TensorDictModuleBase):
         self.act_transform = env.input_managers[ACTION_KEY].symmetry_transform().to(self.device)
 
         _actor = nn.Sequential(ResidualFC(256, 256), Actor(self.action_dim))
-        _critic = nn.Sequential(ResidualFC(256, 256), nn.LazyLinear(1))
+        _critic = nn.Sequential(ResidualFC(256, 256), Critic(1))
 
         EncoderClass = {
             "one": EncoderOne,

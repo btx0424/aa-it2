@@ -236,9 +236,19 @@ class evade_distance(Reward[Game]):
 
     def _compute(self) -> tuple[torch.Tensor, torch.Tensor]:
         is_active = torch.arange(self.num_envs, device=self.device) % 2 == 1
-        rew = 1 - torch.exp(-self.command_manager.distance * 0.5).reshape(
-            self.num_envs, 1
-        )
+        rew = 1 - torch.exp(-self.command_manager.distance * 0.5)
+        return rew.reshape(self.num_envs, 1), is_active.reshape(self.num_envs, 1)
+
+
+class chase_distance(Reward[Game]):
+    namespace = "game"
+
+    def __init__(self, env, weight: float, enabled: bool = True):
+        super().__init__(env, weight, enabled)
+
+    def _compute(self) -> tuple[torch.Tensor, torch.Tensor]:
+        is_active = torch.arange(self.num_envs, device=self.device) % 2 == 0
+        rew = torch.exp(-self.command_manager.distance * 0.5)
         return rew.reshape(self.num_envs, 1), is_active.reshape(self.num_envs, 1)
 
 

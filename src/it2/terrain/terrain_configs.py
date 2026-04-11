@@ -179,7 +179,7 @@ ROUGH_GAME_410 = TerrainGeneratorCfg(
     sub_terrains={
         "curved_corridor": CurvedCorridorTerrainCfg(
             proportion=0.10,
-            turn_radius_range=(1.6, 2.4),
+            turn_radius_range=(2.0, 2.4),
             wall_height=1.0,
             wall_thickness=0.1,
         ),

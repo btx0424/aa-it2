@@ -31,8 +31,8 @@ class EncoderOne(nn.Module):
         self.hidden_dim = hidden_dim
         extero_channels = extero_shape[0] if len(extero_shape) == 3 else 1
 
-        self.cmd_mlp = MLP([cmd_shape[-1], 128, token_dim], activation=activation)
-        self.proprio_mlp = MLP([proprio_shape[-1], 256, token_dim], activation=activation)
+        self.cmd_mlp = MLP([cmd_shape[-1], 128, token_dim], activation=activation, first_non_muon=True)
+        self.proprio_mlp = MLP([proprio_shape[-1], 256, token_dim], activation=activation, first_non_muon=True)
         self.extero_mlp = nn.Sequential(
             nn.Conv2d(extero_channels, 32, kernel_size=3, stride=2, padding=1),
             activation(),
@@ -129,8 +129,8 @@ class EncoderTwo(nn.Module):
         self.hidden_dim = hidden_dim
         extero_channels = extero_shape[0] if len(extero_shape) == 3 else 1
 
-        self.cmd_mlp = MLP([cmd_shape[-1], 128, token_dim], activation=activation)
-        self.proprio_mlp = MLP([proprio_shape[-1], 256, token_dim], activation=activation)
+        self.cmd_mlp = MLP([cmd_shape[-1], 128, token_dim], activation=activation, first_non_muon=True)
+        self.proprio_mlp = MLP([proprio_shape[-1], 256, token_dim], activation=activation, first_non_muon=True)
         self.extero_mlp = nn.Sequential(
             nn.Conv2d(extero_channels, 32, kernel_size=3, stride=2, padding=1),
             activation(),

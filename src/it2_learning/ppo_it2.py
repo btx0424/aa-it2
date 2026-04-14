@@ -47,6 +47,7 @@ from active_adaptation.learning.modules import (
     VecNorm,
 )
 from active_adaptation.learning.utils.opt import MuonAdamWWrapper
+from active_adaptation.learning.utils.distributed import check_parameters
 from active_adaptation.learning.ppo.common import (
     make_batch,
     Actor,
@@ -306,6 +307,7 @@ class PPOPolicy(TensorDictModuleBase):
             self.cmd_norm.synchronize(mode="broadcast")
             self.mlp_norm.synchronize(mode="broadcast")
             self.cnn_norm.synchronize(mode="broadcast")
+            infos["encoder/diff"] = check_parameters(self.encoder)
         return dict(sorted(infos.items()))
 
     @torch.no_grad()

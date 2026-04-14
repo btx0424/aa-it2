@@ -5,6 +5,9 @@ from typing import Type
 from jaxtyping import Float
 
 
+from torch.nn.attention import SDPBackend, sdpa_kernel
+
+
 class EncoderOne(nn.Module):
     """Fuse command, proprio, and extero (e.g. height map) into a single feature vector.
 
@@ -41,6 +44,8 @@ class EncoderOne(nn.Module):
             nn.Flatten(start_dim=1),
         )
         self.modality_embedding = nn.Parameter(torch.randn(3, token_dim) * 0.02)
+        self.modality_embedding._non_muon = True
+        
         self.fusion = nn.MultiheadAttention(
             embed_dim=token_dim,
             num_heads=num_heads,
@@ -80,7 +85,8 @@ class EncoderOne(nn.Module):
         )
         tokens = tokens + self.modality_embedding.unsqueeze(0)
 
-        attn_out, _ = self.fusion(tokens, tokens, tokens, need_weights=False)
+        with sdpa_kernel(backends=[SDPBackend.MATH]):
+            attn_out, _ = self.fusion(tokens, tokens, tokens, need_weights=False)
         tokens = self.fusion_norm(tokens + attn_out)
         tokens = tokens + self.ffn(tokens)
 
@@ -136,6 +142,7 @@ class EncoderTwo(nn.Module):
             nn.Flatten(start_dim=1),
         )
         self.modality_embedding = nn.Parameter(torch.randn(3, token_dim) * 0.02)
+        self.modality_embedding._non_muon = True
 
         self.self_attn = nn.MultiheadAttention(
             embed_dim=token_dim,
@@ -184,15 +191,17 @@ class EncoderTwo(nn.Module):
         )
         tokens = tokens + self.modality_embedding.unsqueeze(0)
 
-        sa_out, _ = self.self_attn(tokens, tokens, tokens, need_weights=False)
+        with sdpa_kernel(backends=[SDPBackend.MATH]):
+            sa_out, _ = self.self_attn(tokens, tokens, tokens, need_weights=False)
         tokens = self.self_attn_norm(tokens + sa_out)
         tokens = tokens + self.ffn(tokens)
 
         cmd_token = tokens[:, 0:1, :]
         proprio_extero = tokens[:, 1:, :]
-        cross_out, _ = self.cross_attn(
-            cmd_token, proprio_extero, proprio_extero, need_weights=False
-        )
+        with sdpa_kernel(backends=[SDPBackend.MATH]):
+            cross_out, _ = self.cross_attn(
+                cmd_token, proprio_extero, proprio_extero, need_weights=False
+            )
         cmd_refined = self.cross_attn_norm(cmd_token + cross_out).squeeze(1)
 
         fused = self.out_proj(

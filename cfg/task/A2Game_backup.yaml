@@ -24,7 +24,7 @@ input:
     _target_: JointPosition
     action_scaling: {.*_joint: 0.5}
     max_delay: 1
-    alpha_range: [0.8, 1.0]
+    alpha_range: [0.5, 1.0]
   future_traj:
     _target_: Marker
     body_frame: true
@@ -52,13 +52,11 @@ observation:
       flatten: true,
     }
   extero:
-    raycast_camera: {
-      resolution: [32, 24],
-      fov_deg: 90.0,
-      rpy_deg: [0.0, 30.0, 0.0],
-      near: 0.1,
-      far: 4.0,
-      body_name: "base_link",
+    height_scan: {
+      x_range: [-1.2, 1.2],
+      y_range: [-1.0, 1.0],
+      resolution: [0.1, 0.1],
+      flatten: false,
     }
   root_state_w:
     root_state_w: {}

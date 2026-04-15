@@ -1,11 +1,27 @@
 import torch
 import torch.nn as nn
 from active_adaptation.learning.modules import MLP
-from typing import Type
+from typing import Type, Literal
 from jaxtyping import Float
 
 
 from torch.nn.attention import SDPBackend, sdpa_kernel
+
+
+def _make_cnn_norm(
+    channels: int,
+    norm: Literal["none", "group"],
+    groups: int,
+) -> nn.Module:
+    if norm == "none":
+        return nn.Identity()
+    if norm != "group":
+        raise ValueError(f"Unsupported cnn_norm={norm!r}, expected 'none' or 'group'.")
+
+    group_count = min(groups, channels)
+    while channels % group_count != 0 and group_count > 1:
+        group_count -= 1
+    return nn.GroupNorm(group_count, channels)
 
 
 class EncoderOne(nn.Module):
@@ -24,6 +40,8 @@ class EncoderOne(nn.Module):
         hidden_dim: int = 256,
         num_heads: int = 4,
         activation: Type[nn.Module] = nn.SiLU,
+        cnn_norm: Literal["none", "group"] = "none",
+        cnn_norm_groups: int = 8,
     ):
         super().__init__()
         self.token_dim = token_dim
@@ -33,10 +51,13 @@ class EncoderOne(nn.Module):
         self.proprio_mlp = MLP([proprio_shape[-1], 256, token_dim], activation=activation, first_non_muon=True)
         self.extero_mlp = nn.Sequential(
             nn.Conv2d(extero_channels, 32, kernel_size=3, stride=2, padding=1),
+            _make_cnn_norm(32, cnn_norm, cnn_norm_groups),
             activation(),
             nn.Conv2d(32, 64, kernel_size=3, stride=2, padding=1),
+            _make_cnn_norm(64, cnn_norm, cnn_norm_groups),
             activation(),
             nn.Conv2d(64, token_dim, kernel_size=3, stride=2, padding=1),
+            _make_cnn_norm(token_dim, cnn_norm, cnn_norm_groups),
             activation(),
             nn.AdaptiveAvgPool2d(1),
             nn.Flatten(start_dim=1),
@@ -120,6 +141,8 @@ class EncoderTwo(nn.Module):
         hidden_dim: int = 256,
         num_heads: int = 4,
         activation: Type[nn.Module] = nn.SiLU,
+        cnn_norm: Literal["none", "group"] = "none",
+        cnn_norm_groups: int = 8,
     ):
         super().__init__()
         self.token_dim = token_dim
@@ -129,10 +152,13 @@ class EncoderTwo(nn.Module):
         self.proprio_mlp = MLP([proprio_shape[-1], 256, token_dim], activation=activation, first_non_muon=True)
         self.extero_mlp = nn.Sequential(
             nn.Conv2d(extero_channels, 32, kernel_size=3, stride=2, padding=1),
+            _make_cnn_norm(32, cnn_norm, cnn_norm_groups),
             activation(),
             nn.Conv2d(32, 64, kernel_size=3, stride=2, padding=1),
+            _make_cnn_norm(64, cnn_norm, cnn_norm_groups),
             activation(),
             nn.Conv2d(64, token_dim, kernel_size=3, stride=2, padding=1),
+            _make_cnn_norm(token_dim, cnn_norm, cnn_norm_groups),
             activation(),
             nn.AdaptiveAvgPool2d(1),
             nn.Flatten(start_dim=1),

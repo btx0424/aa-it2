@@ -90,6 +90,8 @@ class PPOConfig:
 
     in_keys: Tuple[str, ...] = (CMD_KEY, OBS_KEY, "extero", "root_state_w")
     cmd_feature_dim: int = 128
+    cnn_norm: Literal["none", "group"] = "none"
+    cnn_norm_groups: int = 8
     future_pred_dim: int = 7
     future_pred_coef: float = 0.0
     future_pred_minibatches: int = 4
@@ -224,6 +226,8 @@ class PPOPolicy(TensorDictModuleBase):
             proprio_shape,
             extero_shape,
             token_dim=self.cfg.cmd_feature_dim,
+            cnn_norm=self.cfg.cnn_norm,
+            cnn_norm_groups=self.cfg.cnn_norm_groups,
         ).to(self.device)
         
         actor_module = TDMod(_actor, ["_shared_feature"], ["loc", "scale"])

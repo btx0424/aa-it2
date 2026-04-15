@@ -26,6 +26,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 import warnings
 import torch.utils._pytree as pytree
+import functools
 from contextlib import nullcontext
 
 from torchrl.data import Composite, TensorSpec
@@ -46,6 +47,13 @@ from active_adaptation.learning.modules import (
     IndependentNormal,
     VecNorm,
     MLP,
+)
+from active_adaptation.utils.math import (
+    quat_rotate_inverse,
+    quat_mul,
+    quat_conjugate,
+    euler_from_quat,
+    wrap_to_pi,
 )
 from active_adaptation.learning.utils.opt import MuonAdamWWrapper
 from active_adaptation.learning.utils.distributed import check_parameters
@@ -82,9 +90,69 @@ class PPOConfig:
 
     in_keys: Tuple[str, ...] = (CMD_KEY, OBS_KEY, "extero", "root_state_w")
     cmd_feature_dim: int = 128
+    future_pred_dim: int = 7
+    future_pred_coef: float = 0.0
+    future_pred_minibatches: int = 4
+    future_latent_dim: int = 16
+    future_kl_coef: float = 0.01
+    stages: Tuple[str, ...] = ("policy", "future")
+
 
 cs = ConfigStore.instance()
-cs.store("ppo_it2", node=PPOConfig, group="algo")
+cs.store("ppo_it2", node=PPOConfig(stages=("policy",)), group="algo")
+cs.store("ppo_it2_future", node=PPOConfig(stages=("future",), future_pred_coef=1.0), group="algo")
+
+
+class FuturePredictor(nn.Module):
+    """Conditional VAE-style predictor for multi-modal future targets."""
+
+    def __init__(self, feature_dim: int, pred_dim: int, latent_dim: int):
+        super().__init__()
+        self.query_embedding = nn.Parameter(torch.randn(feature_dim) * 0.02)
+        self.query_embedding._non_muon = True
+        self.posterior = nn.Sequential(
+            nn.Linear(feature_dim + pred_dim, 256),
+            nn.SiLU(),
+            nn.LayerNorm(256),
+            nn.Linear(256, 256),
+            nn.SiLU(),
+            nn.Linear(256, 2 * latent_dim),
+        )
+        self.decoder = nn.Sequential(
+            nn.Linear(feature_dim + latent_dim, 256),
+            nn.SiLU(),
+            nn.LayerNorm(256),
+            nn.Linear(256, 256),
+            nn.SiLU(),
+            nn.Linear(256, pred_dim),
+        )
+        self.latent_dim = latent_dim
+        self.reset_parameters()
+
+    def reset_parameters(self):
+        with torch.no_grad():
+            self.query_embedding.normal_(0.0, 0.02)
+        for module in self.modules():
+            if isinstance(module, nn.Linear):
+                nn.init.orthogonal_(module.weight, 0.02)
+                nn.init.constant_(module.bias, 0.0)
+
+    def forward(
+        self,
+        context: torch.Tensor,
+        target: torch.Tensor | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        if target is None:
+            mu = context.new_zeros(*context.shape[:-1], self.latent_dim)
+            logvar = torch.zeros_like(mu)
+            z = torch.randn_like(mu)
+        else:
+            posterior = self.posterior(torch.cat([context, target], dim=-1))
+            mu, logvar = posterior.chunk(2, dim=-1)
+            std = torch.exp(0.5 * logvar)
+            z = mu + std * torch.randn_like(std)
+        pred = self.decoder(torch.cat([context, z], dim=-1))
+        return pred, mu, logvar
 
 
 class PPOPolicy(TensorDictModuleBase):
@@ -136,17 +204,6 @@ class PPOPolicy(TensorDictModuleBase):
             "one": EncoderOne,
             "two": EncoderTwo,
         }[self.cfg.encoder_type]
-
-        def make_fusion_encoder(out_key: str):
-            return TDMod(
-                EncoderClass(
-                    proprio_shape,
-                    extero_shape,
-                    token_dim=self.cfg.cmd_feature_dim,
-                ),
-                ["_cmd_feature", "_obs_normed", "_extero_normed"],
-                [out_key],
-            )
         
         self.cmd_feature_encoder = TDMod(
             MLP(
@@ -157,7 +214,18 @@ class PPOPolicy(TensorDictModuleBase):
             ["_cmd_feature"],
         ).to(self.device)
 
-        self.encoder = make_fusion_encoder("_shared_feature").to(self.device)
+        self.future_predictor = FuturePredictor(
+            feature_dim=self.cfg.cmd_feature_dim,
+            pred_dim=self.cfg.future_pred_dim,
+            latent_dim=self.cfg.future_latent_dim,
+        ).to(self.device)
+
+        self.fusion_encoder: nn.Module = EncoderClass(
+            proprio_shape,
+            extero_shape,
+            token_dim=self.cfg.cmd_feature_dim,
+        ).to(self.device)
+        
         actor_module = TDMod(_actor, ["_shared_feature"], ["loc", "scale"])
         critic_module = TDMod(_critic, ["_shared_feature"], ["state_value"])
 
@@ -171,11 +239,7 @@ class PPOPolicy(TensorDictModuleBase):
 
         self.critic = critic_module.to(self.device)
 
-        self.vecnorm(fake_input)
-        self.cmd_feature_encoder(fake_input)
-        self.encoder(fake_input)
-        self.actor(fake_input)
-        self.critic(fake_input)
+        self.run_policy(fake_input, True, True)
         
         def init_(module):
             if isinstance(module, nn.Linear):
@@ -189,21 +253,24 @@ class PPOPolicy(TensorDictModuleBase):
                 nn.init.constant_(module.actor_mean.bias, 0.)
         
         self.cmd_feature_encoder.apply(init_)
-        self.encoder.apply(init_)
+        self.fusion_encoder.apply(init_)
         self.actor.apply(init_)
         self.critic.apply(init_)
 
         if aa.is_distributed():
             if self.cfg.use_ddp:
                 local_rank = aa.get_local_rank()
-                self.encoder = DDP(self.encoder, device_ids=[local_rank])
+                self.fusion_encoder = DDP(self.fusion_encoder, device_ids=[local_rank])
                 self.cmd_feature_encoder = DDP(self.cmd_feature_encoder, device_ids=[local_rank])
+                self.future_predictor = DDP(self.future_predictor, device_ids=[local_rank])
                 self.actor = DDP(self.actor, device_ids=[local_rank])
                 self.critic = DDP(self.critic, device_ids=[local_rank])
             else:
-                for param in self.encoder.parameters():
+                for param in self.fusion_encoder.parameters():
                     distr.broadcast(param, src=0)
                 for param in self.cmd_feature_encoder.parameters():
+                    distr.broadcast(param, src=0)
+                for param in self.future_predictor.parameters():
                     distr.broadcast(param, src=0)
                 for param in self.actor.parameters():
                     distr.broadcast(param, src=0)
@@ -235,19 +302,48 @@ class PPOPolicy(TensorDictModuleBase):
         #     # TODO: compile for multi-gpu training?
         #     self.update = torch.compile(self.update, fullgraph=True)
         #     # self.update = CudaGraphModule(self.update)
-        self.root_state_w = None
+        self.prev_tensordict = None
+        self._future_enabled = False
+    
+    def run_policy(self, tensordict: TensorDict, actor: bool=False, critic: bool=False) -> TensorDict:
+        tensordict = self.vecnorm(tensordict)
+        tensordict = self.cmd_feature_encoder(tensordict)
+        feature = self.fusion_encoder(
+            query_feature_inp=tensordict["_cmd_feature"],
+            proprio_inp=tensordict["_obs_normed"],
+            extero_inp=tensordict["_extero_normed"],
+        )
+        tensordict["_shared_feature"] = feature
+        if actor:
+            tensordict = self.actor(tensordict)
+        if critic:
+            tensordict = self.critic(tensordict)
+        return tensordict
+    
+    def run_future_prediction(
+        self, tensordict: TensorDict, target: torch.Tensor | None = None
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Query the fusion encoder with the query embedding and decode a VAE sample."""
+        tensordict = self.vecnorm(tensordict)
+        query_embedding = self.future_predictor.query_embedding.expand(*tensordict.shape, -1)
+        feature = self.fusion_encoder(
+            query_feature_inp=query_embedding,
+            proprio_inp=tensordict["_obs_normed"],
+            extero_inp=tensordict["_extero_normed"],
+        )
+        return self.future_predictor(feature, target)
     
     def _configure_optimizers(self):
         if self.cfg.muon:
             self.opt = MuonAdamWWrapper(
-                [self.encoder, self.cmd_feature_encoder, self.actor, self.critic],
+                [self.fusion_encoder, self.cmd_feature_encoder, self.actor, self.critic],
                 lr=self.cfg.lr,
                 weight_decay=0.01
             )
         else:
             self.opt = torch.optim.AdamW(
                 [
-                    {"params": self.encoder.parameters()},
+                    {"params": self.fusion_encoder.parameters()},
                     {"params": self.cmd_feature_encoder.parameters()},
                     {"params": self.actor.parameters()},
                     {"params": self.critic.parameters()},
@@ -255,16 +351,22 @@ class PPOPolicy(TensorDictModuleBase):
                 lr=self.cfg.lr,
                 weight_decay=0.01
             )
+        # Future prediction always uses its own AdamW optimizer.
+        self.opt_future = torch.optim.AdamW(
+            [
+                {"params": self.future_predictor.parameters()},
+            ],
+            lr=self.cfg.lr,
+            weight_decay=0.01,
+        )
 
     def on_stage_start(self, stage: str):
-        pass
+        self._future_enabled = (stage == "future")
+        # Reset temporal cache at stage boundaries to avoid cross-stage leakage.
+        self.prev_tensordict = None
 
     def get_rollout_policy(self, mode: str="train", critic: bool=False):
-        modules = [self.vecnorm, self.cmd_feature_encoder, self.encoder]
-        modules.append(self.actor)
-        if critic:
-            modules.append(self.critic)
-        policy = TDSeq(*modules)
+        policy = functools.partial(self.run_policy, actor=True, critic=critic)
         if self.cfg.compile:
             policy = torch.compile(policy)
         return policy
@@ -273,25 +375,87 @@ class PPOPolicy(TensorDictModuleBase):
     def train_op(self, tensordict: TensorDict):
         assert VecNorm.FROZEN, "VecNorm must be frozen before training"
 
+        infos = {}
         tensordict = tensordict.exclude("stats", ("next", "stats"))
-        policy_info = self.train_policy(tensordict)
+        infos.update(self.train_policy(tensordict))
 
-        root_state_w = tensordict.get("root_state_w", None)
-        if root_state_w is not None and self.root_state_w is None:
-            # TODO: learn to predict the relative state in the future
-            # for i in range(self.cfg.train_every):
-            #     s_curr = self.root_state_w[:, i]
-            #     s_next = root_state_w[:, i]
-            #     # transform s_next to the current frame
-            pass
+        if (
+            self._future_enabled
+            and self.prev_tensordict is not None
+            and self.cfg.future_pred_coef > 0.0
+        ):
+            infos.update(self.train_future_prediction(tensordict))
+        self.prev_tensordict = tensordict.clone()
 
-        self.root_state_w = root_state_w.clone()
-        
-        return dict(sorted(policy_info.items()))
+        return dict(sorted(infos.items()))
+    
+    def train_future_prediction(self, tensordict: TensorDict):
+        self.fusion_encoder.requires_grad_(False) # freeze the fusion encoder
+        eid = tensordict["episode_id"]
+        prev_eid = self.prev_tensordict["episode_id"] # (N, T)
+        root_state_w = tensordict.get("root_state_w")
+        prev_root_state_w = self.prev_tensordict.get("root_state_w")
+        same_episode = (eid == prev_eid).reshape_as(tensordict["is_init"]) # (N, T, 1)
+        valid_mask = same_episode & (~tensordict["is_init"]) & (~self.prev_tensordict["is_init"])
+
+        prev_pos = prev_root_state_w[..., :3]
+        prev_quat = prev_root_state_w[..., 3:7]
+        curr_pos = root_state_w[..., :3]
+        curr_quat = root_state_w[..., 3:7]
+        curr_linvel = root_state_w[..., 7:10]
+
+        # convert to relative
+        rel_pos = quat_rotate_inverse(prev_quat, curr_pos - prev_pos)
+        rel_quat = quat_mul(quat_conjugate(prev_quat), curr_quat)
+        rel_yaw = wrap_to_pi(euler_from_quat(rel_quat)[..., 2]).unsqueeze(-1)
+        rel_linvel = quat_rotate_inverse(prev_quat, curr_linvel)
+        target = torch.cat([rel_pos, rel_yaw, rel_linvel], dim=-1)
+        future_td = self.prev_tensordict.select(CMD_KEY, OBS_KEY, "extero").copy()
+        future_td["_future_target"] = target
+        future_td["_future_valid"] = valid_mask
+
+        total_weight = target.new_zeros(())
+        total_sqerr = target.new_zeros(())
+        total_kl_weighted = target.new_zeros(())
+        for minibatch in make_batch(future_td, self.cfg.future_pred_minibatches):
+            pred, mu, logvar = self.run_future_prediction(minibatch, minibatch["_future_target"])
+            valid = minibatch["_future_valid"].unsqueeze(-1).expand_as(pred).float()
+            weight = valid.sum()
+            if weight.item() == 0:
+                continue
+            sqerr = ((pred - minibatch["_future_target"]).square() * valid).sum()
+            pred_loss = sqerr / weight
+            kl_per_sample = -0.5 * (
+                1 + logvar - mu.square() - logvar.exp()
+            ).sum(dim=-1, keepdim=True)
+            valid_sample = minibatch["_future_valid"].float().unsqueeze(-1)
+            kl_weight = valid_sample.sum()
+            kl_loss = (kl_per_sample * valid_sample).sum() / kl_weight.clamp_min(1.0)
+            loss = self.cfg.future_pred_coef * (
+                pred_loss + self.cfg.future_kl_coef * kl_loss
+            )
+
+            self.opt_future.zero_grad(set_to_none=True)
+            loss.backward()
+            if aa.is_distributed() and not self.cfg.use_ddp:
+                allreduce_grads(self.future_predictor.parameters())
+            self.opt_future.step()
+            total_weight += weight.detach()
+            total_sqerr += sqerr.detach()
+            total_kl_weighted += (kl_loss.detach() * kl_weight.detach())
+
+        self.fusion_encoder.requires_grad_(True)
+        pred_loss = total_sqerr / total_weight.clamp_min(1.0)
+        kl_loss = total_kl_weighted / valid_mask.float().sum().clamp_min(1.0)
+        return {
+            "future/pred_loss": pred_loss.detach(),
+            "future/kl_loss": kl_loss.detach(),
+            "future/valid_ratio": valid_mask.float().mean().detach(),
+        }
 
     def train_policy(self, tensordict: TensorDict):
         infos = []
-        self._compute_advantage(tensordict, self.critic, "adv", "ret")
+        self._compute_advantage(tensordict, "adv", "ret")
         action = tensordict[ACTION_KEY]
         adv_unnormalized = tensordict["adv"].clone()
         log_probs_before = tensordict["action_log_prob"]
@@ -310,8 +474,7 @@ class PPOPolicy(TensorDictModuleBase):
         
         with torch.no_grad():
             tensordict_ = tensordict.copy()
-            self.encoder(tensordict_)
-            tensordict_ = self.actor(tensordict_)
+            self.run_policy(tensordict_, actor=True, critic=False)
             dist = IndependentNormal(tensordict_["loc"], tensordict_["scale"])
             log_probs_after = dist.log_prob(action)
             log_ratio = (log_probs_after - log_probs_before).reshape_as(adv_unnormalized)
@@ -332,28 +495,21 @@ class PPOPolicy(TensorDictModuleBase):
             self.cmd_norm.synchronize(mode="broadcast")
             self.mlp_norm.synchronize(mode="broadcast")
             self.cnn_norm.synchronize(mode="broadcast")
-            infos["encoder/diff"] = check_parameters(self.encoder)
+            infos["encoder/diff"] = check_parameters(self.fusion_encoder)
         return infos
 
     @torch.no_grad()
     def _compute_advantage(
         self, 
         tensordict: TensorDict,
-        critic: TDMod, 
         adv_key: str="adv",
         ret_key: str="ret",
     ):
         keys = tensordict.keys(True, True)
         if not ("state_value" in keys and ("next", "state_value") in keys):
             with tensordict.view(-1) as tensordict_flat:
-                self.vecnorm(tensordict_flat)
-                self.cmd_feature_encoder(tensordict_flat)
-                self.encoder(tensordict_flat)
-                critic(tensordict_flat)
-                self.vecnorm(tensordict_flat["next"])
-                self.cmd_feature_encoder(tensordict_flat["next"])
-                self.encoder(tensordict_flat["next"])
-                critic(tensordict_flat["next"])
+                self.run_policy(tensordict_flat, False, True)
+                self.run_policy(tensordict_flat["next"], False, True)
 
         values = tensordict["state_value"]
         next_values = tensordict["next", "state_value"]
@@ -391,16 +547,16 @@ class PPOPolicy(TensorDictModuleBase):
             else nullcontext()
         )
         with amp_ctx:
-            self.vecnorm(tensordict)
-            self.cmd_feature_encoder(tensordict)
-            self.encoder(tensordict)
+            action_data = tensordict[ACTION_KEY]
+            log_probs_data = tensordict["action_log_prob"]
+            value_targets = tensordict["ret"]
+            adv = tensordict["adv"]
+
+            self.run_policy(tensordict, True, True)
 
             valid = (~tensordict["is_init"])
             valid_cnt = valid.sum()
 
-            action_data = tensordict[ACTION_KEY]
-            log_probs_data = tensordict["action_log_prob"]
-            self.actor(tensordict)
             dist = IndependentNormal(tensordict["loc"], tensordict["scale"])
             log_probs = dist.log_prob(action_data)
             entropy = (dist.entropy().reshape_as(valid) * valid).sum() / valid_cnt
@@ -413,9 +569,8 @@ class PPOPolicy(TensorDictModuleBase):
             policy_loss = - (torch.min(surr1, surr2).reshape_as(valid) * valid).sum() / valid_cnt
             entropy_loss = - self.entropy_coef * entropy
 
-            b_returns = tensordict["ret"]
-            values = self.critic(tensordict)["state_value"]
-            value_loss = self.critic_loss_fn(b_returns, values)
+            values = tensordict["state_value"]
+            value_loss = self.critic_loss_fn(values, value_targets)
             value_loss = (value_loss.reshape_as(valid) * valid).sum() / valid_cnt
 
             loss = policy_loss + entropy_loss + value_loss
@@ -428,20 +583,12 @@ class PPOPolicy(TensorDictModuleBase):
             loss.backward()
 
         if aa.is_distributed() and not self.cfg.use_ddp:
-            for param in self.cmd_feature_encoder.parameters():
-                distr.all_reduce(param.grad, op=distr.ReduceOp.SUM)
-                param.grad /= aa.get_world_size()
-            for param in self.encoder.parameters():
-                distr.all_reduce(param.grad, op=distr.ReduceOp.SUM)
-                param.grad /= aa.get_world_size()
-            for param in self.actor.parameters():
-                distr.all_reduce(param.grad, op=distr.ReduceOp.SUM)
-                param.grad /= aa.get_world_size()
-            for param in self.critic.parameters():
-                distr.all_reduce(param.grad, op=distr.ReduceOp.SUM)
-                param.grad /= aa.get_world_size()
+            allreduce_grads(self.cmd_feature_encoder.parameters())
+            allreduce_grads(self.fusion_encoder.parameters())
+            allreduce_grads(self.actor.parameters())
+            allreduce_grads(self.critic.parameters())
 
-        encoder_grad_norm = nn.utils.clip_grad_norm_(self.encoder.parameters(), self.max_grad_norm)
+        encoder_grad_norm = nn.utils.clip_grad_norm_(self.fusion_encoder.parameters(), self.max_grad_norm)
         actor_grad_norm = nn.utils.clip_grad_norm_(self.actor.parameters(), self.max_grad_norm)
         critic_grad_norm = nn.utils.clip_grad_norm_(self.critic.parameters(), self.max_grad_norm)
 
@@ -452,7 +599,7 @@ class PPOPolicy(TensorDictModuleBase):
             self.opt.step()
         
         with torch.no_grad():
-            explained_var = 1 - value_loss / b_returns[valid].var()
+            explained_var = 1 - value_loss / value_targets[valid].var()
             clipfrac = ((ratio - 1.0).abs() > self.clip_param).float().mean()
             approx_kl = ((ratio - 1.0) - log_ratio).mean()
             symmetry_loss = F.mse_loss(dist.mean[bsize//2:], self.act_transform(dist.mean[:bsize//2]))
@@ -500,3 +647,13 @@ def normalize(x: torch.Tensor, subtract_mean: bool=False):
         return (x - x.mean()) / std.clamp(1e-7), std
     else:
         return x  / std.clamp(1e-7), std
+
+
+def allreduce_grads(params):
+    """Synchronize gradients across ranks for manual (non-DDP) training."""
+    for param in params:
+        if param.grad is None:
+            continue
+        distr.all_reduce(param.grad, op=distr.ReduceOp.SUM)
+        param.grad /= aa.get_world_size()
+

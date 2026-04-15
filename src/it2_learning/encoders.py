@@ -9,7 +9,7 @@ from torch.nn.attention import SDPBackend, sdpa_kernel
 
 
 class EncoderOne(nn.Module):
-    """Fuse command-feature, proprio, and extero into a single feature vector.
+    """Fuse query-feature, proprio, and extero into a single feature vector.
 
     Each modality is embedded to a shared ``token_dim``. Three tokens attend to each
     other with multi-head self-attention, then a per-token FFN. The flattened tokens
@@ -64,22 +64,22 @@ class EncoderOne(nn.Module):
 
     def forward(
         self,
-        cmd_feature_inp: Float[torch.Tensor, "... D"],
+        query_feature_inp: Float[torch.Tensor, "... D"],
         proprio_inp: Float[torch.Tensor, ".. D"],
         extero_inp: Float[torch.Tensor, ".. C H W"],
     ):
         batch_shape = proprio_inp.shape[:-1]
 
-        cmd_flat = cmd_feature_inp.reshape(-1, cmd_feature_inp.shape[-1])
+        query_flat = query_feature_inp.reshape(-1, query_feature_inp.shape[-1])
         proprio_flat = proprio_inp.reshape(-1, proprio_inp.shape[-1])
         extero_flat = extero_inp.reshape(-1, *extero_inp.shape[-3:])
 
-        cmd_feature = cmd_flat
+        query_feature = query_flat
         proprio_feature = self.proprio_mlp(proprio_flat)
         extero_feature = self.extero_mlp(extero_flat)
 
         tokens = torch.stack(
-            [cmd_feature, proprio_feature, extero_feature], dim=1
+            [query_feature, proprio_feature, extero_feature], dim=1
         )
         tokens = tokens + self.modality_embedding.unsqueeze(0)
 
@@ -97,14 +97,14 @@ class EncoderTwo(nn.Module):
 
     Pipeline:
 
-    1. **Embed** proprio and extero into tokens and consume a precomputed command
-       feature token (order: cmd → proprio → extero) plus learned modality embeddings.
+    1. **Embed** proprio and extero into tokens and consume a precomputed query
+       feature token (order: query → proprio → extero) plus learned modality embeddings.
     2. **Self-attention** over all three tokens (mixing modalities), residual +
        layer norm, then the same per-token FFN + residual as ``EncoderOne``.
-    3. **Cross-attention**: the command token is the **query**; proprio and extero
-       tokens are **keys/values**. The command representation is updated with a
-       residual and layer norm (``cmd_refined``).
-    4. **Aggregate**: concatenate ``cmd_refined`` with the (post-FFN) proprio and
+    3. **Cross-attention**: the query token is the **query**; proprio and extero
+       tokens are **keys/values**. The query representation is updated with a
+       residual and layer norm (``query_refined``).
+    4. **Aggregate**: concatenate ``query_refined`` with the (post-FFN) proprio and
        extero tokens and linearly project to ``hidden_dim``.
 
     The cross-attention step lets the command slot explicitly pull task-relevant
@@ -168,22 +168,22 @@ class EncoderTwo(nn.Module):
 
     def forward(
         self,
-        cmd_feature_inp: Float[torch.Tensor, "... D"],
+        query_feature_inp: Float[torch.Tensor, "... D"],
         proprio_inp: Float[torch.Tensor, "... D"],
         extero_inp: Float[torch.Tensor, "... C H W"],
     ):
         batch_shape = proprio_inp.shape[:-1]
 
-        cmd_flat = cmd_feature_inp.reshape(-1, cmd_feature_inp.shape[-1])
+        query_flat = query_feature_inp.reshape(-1, query_feature_inp.shape[-1])
         proprio_flat = proprio_inp.reshape(-1, proprio_inp.shape[-1])
         extero_flat = extero_inp.reshape(-1, *extero_inp.shape[-3:])
 
-        cmd_feature = cmd_flat
+        query_feature = query_flat
         proprio_feature = self.proprio_mlp(proprio_flat)
         extero_feature = self.extero_mlp(extero_flat)
 
         tokens = torch.stack(
-            [cmd_feature, proprio_feature, extero_feature], dim=1
+            [query_feature, proprio_feature, extero_feature], dim=1
         )
         tokens = tokens + self.modality_embedding.unsqueeze(0)
 
@@ -192,15 +192,15 @@ class EncoderTwo(nn.Module):
         tokens = self.self_attn_norm(tokens + sa_out)
         tokens = tokens + self.ffn(tokens)
 
-        cmd_token = tokens[:, 0:1, :]
+        query_token = tokens[:, 0:1, :]
         proprio_extero = tokens[:, 1:, :]
         with sdpa_kernel(backends=[SDPBackend.MATH]):
             cross_out, _ = self.cross_attn(
-                cmd_token, proprio_extero, proprio_extero, need_weights=False
+                query_token, proprio_extero, proprio_extero, need_weights=False
             )
-        cmd_refined = self.cross_attn_norm(cmd_token + cross_out).squeeze(1)
+        query_refined = self.cross_attn_norm(query_token + cross_out).squeeze(1)
 
         fused = self.out_proj(
-            torch.cat([cmd_refined, tokens[:, 1], tokens[:, 2]], dim=-1)
+            torch.cat([query_refined, tokens[:, 1], tokens[:, 2]], dim=-1)
         )
         return fused.reshape(*batch_shape, self.hidden_dim)

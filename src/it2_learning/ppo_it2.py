@@ -90,7 +90,7 @@ class PPOConfig:
 
     in_keys: Tuple[str, ...] = (CMD_KEY, OBS_KEY, "extero", "root_state_w")
     cmd_feature_dim: int = 128
-    cnn_norm: Literal["none", "group"] = "none"
+    cnn_norm: str = "none"
     cnn_norm_groups: int = 8
     future_pred_dim: int = 7
     future_pred_coef: float = 0.0
@@ -308,7 +308,12 @@ class PPOPolicy(TensorDictModuleBase):
         #     # self.update = CudaGraphModule(self.update)
         self.prev_tensordict = None
         self._future_enabled = False
-    
+
+    @property
+    def _future_predictor_unwrapped(self) -> FuturePredictor:
+        fp = self.future_predictor
+        return fp.module if isinstance(fp, DDP) else fp
+
     def run_policy(self, tensordict: TensorDict, actor: bool=False, critic: bool=False) -> TensorDict:
         tensordict = self.vecnorm(tensordict)
         tensordict = self.cmd_feature_encoder(tensordict)
@@ -329,7 +334,9 @@ class PPOPolicy(TensorDictModuleBase):
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """Query the fusion encoder with the query embedding and decode a VAE sample."""
         tensordict = self.vecnorm(tensordict)
-        query_embedding = self.future_predictor.query_embedding.expand(*tensordict.shape, -1)
+        query_embedding = self._future_predictor_unwrapped.query_embedding.expand(
+            *tensordict.shape, -1
+        )
         feature = self.fusion_encoder(
             query_feature_inp=query_embedding,
             proprio_inp=tensordict["_obs_normed"],

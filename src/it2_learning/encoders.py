@@ -36,7 +36,7 @@ class EncoderOne(nn.Module):
         self,
         proprio_shape: torch.Size,
         extero_shape: torch.Size, # usually a height map of shape [1, H, W]
-        token_dim: int = 128,
+        token_dim: int = 256,
         hidden_dim: int = 256,
         num_heads: int = 4,
         activation: Type[nn.Module] = nn.SiLU,
@@ -82,6 +82,7 @@ class EncoderOne(nn.Module):
             nn.Linear(3 * token_dim, hidden_dim),
             activation(),
         )
+        self.output_dim = hidden_dim
 
     def forward(
         self,
@@ -137,7 +138,7 @@ class EncoderTwo(nn.Module):
         self,
         proprio_shape: torch.Size,
         extero_shape: torch.Size,
-        token_dim: int = 128,
+        token_dim: int = 256,
         hidden_dim: int = 256,
         num_heads: int = 4,
         activation: Type[nn.Module] = nn.SiLU,
@@ -191,6 +192,7 @@ class EncoderTwo(nn.Module):
             nn.Linear(3 * token_dim, hidden_dim),
             activation(),
         )
+        self.output_dim = hidden_dim
 
     def forward(
         self,

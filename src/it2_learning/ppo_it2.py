@@ -89,7 +89,6 @@ class PPOConfig:
     use_amp: bool = False
 
     in_keys: Tuple[str, ...] = (CMD_KEY, OBS_KEY, "extero", "root_state_w")
-    cmd_feature_dim: int = 128
     cnn_norm: str = "none"
     cnn_norm_groups: int = 8
     future_pred_dim: int = 7
@@ -108,12 +107,21 @@ cs.store("ppo_it2_future", node=PPOConfig(stages=("future",), future_pred_coef=1
 class FuturePredictor(nn.Module):
     """Conditional VAE-style predictor for multi-modal future targets."""
 
-    def __init__(self, feature_dim: int, pred_dim: int, latent_dim: int):
+    def __init__(
+        self,
+        context_dim: int,
+        pred_dim: int,
+        latent_dim: int,
+    ):
         super().__init__()
-        self.query_embedding = nn.Parameter(torch.randn(feature_dim) * 0.02)
+        self.context_dim = context_dim
+        self.pred_dim = pred_dim
+        self.latent_dim = latent_dim
+
+        self.query_embedding = nn.Parameter(torch.randn(context_dim) * 0.02)
         self.query_embedding._non_muon = True
         self.posterior = nn.Sequential(
-            nn.Linear(feature_dim + pred_dim, 256),
+            nn.Linear(context_dim + pred_dim, 256),
             nn.SiLU(),
             nn.LayerNorm(256),
             nn.Linear(256, 256),
@@ -121,14 +129,13 @@ class FuturePredictor(nn.Module):
             nn.Linear(256, 2 * latent_dim),
         )
         self.decoder = nn.Sequential(
-            nn.Linear(feature_dim + latent_dim, 256),
+            nn.Linear(context_dim + latent_dim, 256),
             nn.SiLU(),
             nn.LayerNorm(256),
             nn.Linear(256, 256),
             nn.SiLU(),
             nn.Linear(256, pred_dim),
         )
-        self.latent_dim = latent_dim
         self.reset_parameters()
 
     def reset_parameters(self):
@@ -209,25 +216,26 @@ class PPOPolicy(TensorDictModuleBase):
         
         self.cmd_feature_encoder = TDMod(
             MLP(
-                [cmd_shape[-1], 128, self.cfg.cmd_feature_dim],
+                [cmd_shape[-1], 128, 256],
                 first_non_muon=True,
             ),
             ["_cmd_normed"],
             ["_cmd_feature"],
         ).to(self.device)
 
-        self.future_predictor = FuturePredictor(
-            feature_dim=self.cfg.cmd_feature_dim,
-            pred_dim=self.cfg.future_pred_dim,
-            latent_dim=self.cfg.future_latent_dim,
-        ).to(self.device)
-
         self.fusion_encoder: nn.Module = EncoderClass(
             proprio_shape,
             extero_shape,
-            token_dim=self.cfg.cmd_feature_dim,
+            token_dim=256,
             cnn_norm=self.cfg.cnn_norm,
             cnn_norm_groups=self.cfg.cnn_norm_groups,
+            hidden_dim=256,
+        ).to(self.device)
+
+        self.future_predictor = FuturePredictor(
+            context_dim=self.fusion_encoder.output_dim,
+            pred_dim=self.cfg.future_pred_dim,
+            latent_dim=self.cfg.future_latent_dim,
         ).to(self.device)
         
         actor_module = TDMod(_actor, ["_shared_feature"], ["loc", "scale"])
@@ -430,7 +438,7 @@ class PPOPolicy(TensorDictModuleBase):
         total_kl_weighted = target.new_zeros(())
         for minibatch in make_batch(future_td, self.cfg.future_pred_minibatches):
             pred, mu, logvar = self.run_future_prediction(minibatch, minibatch["_future_target"])
-            valid = minibatch["_future_valid"].unsqueeze(-1).expand_as(pred).float()
+            valid = minibatch["_future_valid"].float()
             weight = valid.sum()
             if weight.item() == 0:
                 continue
@@ -439,7 +447,7 @@ class PPOPolicy(TensorDictModuleBase):
             kl_per_sample = -0.5 * (
                 1 + logvar - mu.square() - logvar.exp()
             ).sum(dim=-1, keepdim=True)
-            valid_sample = minibatch["_future_valid"].float().unsqueeze(-1)
+            valid_sample = minibatch["_future_valid"].float()
             kl_weight = valid_sample.sum()
             kl_loss = (kl_per_sample * valid_sample).sum() / kl_weight.clamp_min(1.0)
             loss = self.cfg.future_pred_coef * (

@@ -45,6 +45,7 @@ from collections import OrderedDict
 from active_adaptation.learning.modules import (
     IndependentNormal,
     VecNorm,
+    MLP,
 )
 from active_adaptation.learning.utils.opt import MuonAdamWWrapper
 from active_adaptation.learning.utils.distributed import check_parameters
@@ -74,13 +75,13 @@ class PPOConfig:
     entropy_coef: float = 0.002
 
     encoder_type: str = "one"
-    share_encoder: bool = False
     muon: bool = False
     compile: bool = False
     use_ddp: bool = True
     use_amp: bool = False
 
-    in_keys: Tuple[str, ...] = (CMD_KEY, OBS_KEY, "extero")
+    in_keys: Tuple[str, ...] = (CMD_KEY, OBS_KEY, "extero", "root_state_w")
+    cmd_feature_dim: int = 128
 
 cs = ConfigStore.instance()
 cs.store("ppo_it2", node=PPOConfig, group="algo")
@@ -136,25 +137,29 @@ class PPOPolicy(TensorDictModuleBase):
             "two": EncoderTwo,
         }[self.cfg.encoder_type]
 
-        def make_encoder(out_key: str):
+        def make_fusion_encoder(out_key: str):
             return TDMod(
-                EncoderClass(cmd_shape, proprio_shape, extero_shape),
-                [CMD_KEY, "_obs_normed", "_extero_normed"], [out_key]
+                EncoderClass(
+                    proprio_shape,
+                    extero_shape,
+                    token_dim=self.cfg.cmd_feature_dim,
+                ),
+                ["_cmd_feature", "_obs_normed", "_extero_normed"],
+                [out_key],
             )
+        
+        self.cmd_feature_encoder = TDMod(
+            MLP(
+                [cmd_shape[-1], 128, self.cfg.cmd_feature_dim],
+                first_non_muon=True,
+            ),
+            ["_cmd_normed"],
+            ["_cmd_feature"],
+        ).to(self.device)
 
-        if self.cfg.share_encoder:
-            self.encoder = make_encoder("_shared_feature").to(self.device)
-            self.actor_encoder = self.encoder
-            actor_module = TDMod(_actor, ["_shared_feature"], ["loc", "scale"])
-            critic_module = TDMod(_critic, ["_shared_feature"], ["state_value"])
-        else:
-            self.actor_encoder = make_encoder("_actor_feature")
-            self.encoder = TDSeq(
-                self.actor_encoder,
-                make_encoder("_critic_feature"),
-            ).to(self.device)
-            actor_module = TDMod(_actor, ["_actor_feature"], ["loc", "scale"])
-            critic_module = TDMod(_critic, ["_critic_feature"], ["state_value"])
+        self.encoder = make_fusion_encoder("_shared_feature").to(self.device)
+        actor_module = TDMod(_actor, ["_shared_feature"], ["loc", "scale"])
+        critic_module = TDMod(_critic, ["_shared_feature"], ["state_value"])
 
         self.actor: ProbabilisticActor = ProbabilisticActor(
             module=actor_module,
@@ -167,6 +172,7 @@ class PPOPolicy(TensorDictModuleBase):
         self.critic = critic_module.to(self.device)
 
         self.vecnorm(fake_input)
+        self.cmd_feature_encoder(fake_input)
         self.encoder(fake_input)
         self.actor(fake_input)
         self.critic(fake_input)
@@ -182,6 +188,7 @@ class PPOPolicy(TensorDictModuleBase):
                 nn.init.orthogonal_(module.actor_mean.weight, 0.01)
                 nn.init.constant_(module.actor_mean.bias, 0.)
         
+        self.cmd_feature_encoder.apply(init_)
         self.encoder.apply(init_)
         self.actor.apply(init_)
         self.critic.apply(init_)
@@ -190,10 +197,13 @@ class PPOPolicy(TensorDictModuleBase):
             if self.cfg.use_ddp:
                 local_rank = aa.get_local_rank()
                 self.encoder = DDP(self.encoder, device_ids=[local_rank])
+                self.cmd_feature_encoder = DDP(self.cmd_feature_encoder, device_ids=[local_rank])
                 self.actor = DDP(self.actor, device_ids=[local_rank])
                 self.critic = DDP(self.critic, device_ids=[local_rank])
             else:
                 for param in self.encoder.parameters():
+                    distr.broadcast(param, src=0)
+                for param in self.cmd_feature_encoder.parameters():
                     distr.broadcast(param, src=0)
                 for param in self.actor.parameters():
                     distr.broadcast(param, src=0)
@@ -225,11 +235,12 @@ class PPOPolicy(TensorDictModuleBase):
         #     # TODO: compile for multi-gpu training?
         #     self.update = torch.compile(self.update, fullgraph=True)
         #     # self.update = CudaGraphModule(self.update)
+        self.root_state_w = None
     
     def _configure_optimizers(self):
         if self.cfg.muon:
             self.opt = MuonAdamWWrapper(
-                [self.encoder, self.actor, self.critic],
+                [self.encoder, self.cmd_feature_encoder, self.actor, self.critic],
                 lr=self.cfg.lr,
                 weight_decay=0.01
             )
@@ -237,6 +248,7 @@ class PPOPolicy(TensorDictModuleBase):
             self.opt = torch.optim.AdamW(
                 [
                     {"params": self.encoder.parameters()},
+                    {"params": self.cmd_feature_encoder.parameters()},
                     {"params": self.actor.parameters()},
                     {"params": self.critic.parameters()},
                 ],
@@ -248,13 +260,11 @@ class PPOPolicy(TensorDictModuleBase):
         pass
 
     def get_rollout_policy(self, mode: str="train", critic: bool=False):
+        modules = [self.vecnorm, self.cmd_feature_encoder, self.encoder]
+        modules.append(self.actor)
         if critic:
-            policy = TDSeq(self.vecnorm, self.encoder, self.actor, self.critic)
-        else:
-            if self.cfg.share_encoder:
-                policy = TDSeq(self.vecnorm, self.encoder, self.actor)
-            else:
-                policy = TDSeq(self.vecnorm, self.actor_encoder, self.actor)
+            modules.append(self.critic)
+        policy = TDSeq(*modules)
         if self.cfg.compile:
             policy = torch.compile(policy)
         return policy
@@ -264,7 +274,22 @@ class PPOPolicy(TensorDictModuleBase):
         assert VecNorm.FROZEN, "VecNorm must be frozen before training"
 
         tensordict = tensordict.exclude("stats", ("next", "stats"))
+        policy_info = self.train_policy(tensordict)
 
+        root_state_w = tensordict.get("root_state_w", None)
+        if root_state_w is not None and self.root_state_w is None:
+            # TODO: learn to predict the relative state in the future
+            # for i in range(self.cfg.train_every):
+            #     s_curr = self.root_state_w[:, i]
+            #     s_next = root_state_w[:, i]
+            #     # transform s_next to the current frame
+            pass
+
+        self.root_state_w = root_state_w.clone()
+        
+        return dict(sorted(policy_info.items()))
+
+    def train_policy(self, tensordict: TensorDict):
         infos = []
         self._compute_advantage(tensordict, self.critic, "adv", "ret")
         action = tensordict[ACTION_KEY]
@@ -308,7 +333,7 @@ class PPOPolicy(TensorDictModuleBase):
             self.mlp_norm.synchronize(mode="broadcast")
             self.cnn_norm.synchronize(mode="broadcast")
             infos["encoder/diff"] = check_parameters(self.encoder)
-        return dict(sorted(infos.items()))
+        return infos
 
     @torch.no_grad()
     def _compute_advantage(
@@ -322,9 +347,11 @@ class PPOPolicy(TensorDictModuleBase):
         if not ("state_value" in keys and ("next", "state_value") in keys):
             with tensordict.view(-1) as tensordict_flat:
                 self.vecnorm(tensordict_flat)
+                self.cmd_feature_encoder(tensordict_flat)
                 self.encoder(tensordict_flat)
                 critic(tensordict_flat)
                 self.vecnorm(tensordict_flat["next"])
+                self.cmd_feature_encoder(tensordict_flat["next"])
                 self.encoder(tensordict_flat["next"])
                 critic(tensordict_flat["next"])
 
@@ -365,6 +392,7 @@ class PPOPolicy(TensorDictModuleBase):
         )
         with amp_ctx:
             self.vecnorm(tensordict)
+            self.cmd_feature_encoder(tensordict)
             self.encoder(tensordict)
 
             valid = (~tensordict["is_init"])
@@ -400,6 +428,9 @@ class PPOPolicy(TensorDictModuleBase):
             loss.backward()
 
         if aa.is_distributed() and not self.cfg.use_ddp:
+            for param in self.cmd_feature_encoder.parameters():
+                distr.all_reduce(param.grad, op=distr.ReduceOp.SUM)
+                param.grad /= aa.get_world_size()
             for param in self.encoder.parameters():
                 distr.all_reduce(param.grad, op=distr.ReduceOp.SUM)
                 param.grad /= aa.get_world_size()

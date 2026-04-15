@@ -9,7 +9,7 @@ from torch.nn.attention import SDPBackend, sdpa_kernel
 
 
 class EncoderOne(nn.Module):
-    """Fuse command, proprio, and extero (e.g. height map) into a single feature vector.
+    """Fuse command-feature, proprio, and extero into a single feature vector.
 
     Each modality is embedded to a shared ``token_dim``. Three tokens attend to each
     other with multi-head self-attention, then a per-token FFN. The flattened tokens
@@ -18,7 +18,6 @@ class EncoderOne(nn.Module):
 
     def __init__(
         self,
-        cmd_shape: torch.Size,
         proprio_shape: torch.Size,
         extero_shape: torch.Size, # usually a height map of shape [1, H, W]
         token_dim: int = 128,
@@ -31,7 +30,6 @@ class EncoderOne(nn.Module):
         self.hidden_dim = hidden_dim
         extero_channels = extero_shape[0] if len(extero_shape) == 3 else 1
 
-        self.cmd_mlp = MLP([cmd_shape[-1], 128, token_dim], activation=activation, first_non_muon=True)
         self.proprio_mlp = MLP([proprio_shape[-1], 256, token_dim], activation=activation, first_non_muon=True)
         self.extero_mlp = nn.Sequential(
             nn.Conv2d(extero_channels, 32, kernel_size=3, stride=2, padding=1),
@@ -66,17 +64,17 @@ class EncoderOne(nn.Module):
 
     def forward(
         self,
-        cmd_inp: Float[torch.Tensor, "... D"],
+        cmd_feature_inp: Float[torch.Tensor, "... D"],
         proprio_inp: Float[torch.Tensor, ".. D"],
         extero_inp: Float[torch.Tensor, ".. C H W"],
     ):
         batch_shape = proprio_inp.shape[:-1]
 
-        cmd_flat = cmd_inp.reshape(-1, cmd_inp.shape[-1])
+        cmd_flat = cmd_feature_inp.reshape(-1, cmd_feature_inp.shape[-1])
         proprio_flat = proprio_inp.reshape(-1, proprio_inp.shape[-1])
         extero_flat = extero_inp.reshape(-1, *extero_inp.shape[-3:])
 
-        cmd_feature = self.cmd_mlp(cmd_flat)
+        cmd_feature = cmd_flat
         proprio_feature = self.proprio_mlp(proprio_flat)
         extero_feature = self.extero_mlp(extero_flat)
 
@@ -99,8 +97,8 @@ class EncoderTwo(nn.Module):
 
     Pipeline:
 
-    1. **Embed** command, proprio, and extero into three tokens (order:
-       cmd → proprio → extero) plus learned modality embeddings.
+    1. **Embed** proprio and extero into tokens and consume a precomputed command
+       feature token (order: cmd → proprio → extero) plus learned modality embeddings.
     2. **Self-attention** over all three tokens (mixing modalities), residual +
        layer norm, then the same per-token FFN + residual as ``EncoderOne``.
     3. **Cross-attention**: the command token is the **query**; proprio and extero
@@ -116,7 +114,6 @@ class EncoderTwo(nn.Module):
 
     def __init__(
         self,
-        cmd_shape: torch.Size,
         proprio_shape: torch.Size,
         extero_shape: torch.Size,
         token_dim: int = 128,
@@ -129,7 +126,6 @@ class EncoderTwo(nn.Module):
         self.hidden_dim = hidden_dim
         extero_channels = extero_shape[0] if len(extero_shape) == 3 else 1
 
-        self.cmd_mlp = MLP([cmd_shape[-1], 128, token_dim], activation=activation, first_non_muon=True)
         self.proprio_mlp = MLP([proprio_shape[-1], 256, token_dim], activation=activation, first_non_muon=True)
         self.extero_mlp = nn.Sequential(
             nn.Conv2d(extero_channels, 32, kernel_size=3, stride=2, padding=1),
@@ -172,17 +168,17 @@ class EncoderTwo(nn.Module):
 
     def forward(
         self,
-        cmd_inp: Float[torch.Tensor, "... D"],
+        cmd_feature_inp: Float[torch.Tensor, "... D"],
         proprio_inp: Float[torch.Tensor, "... D"],
         extero_inp: Float[torch.Tensor, "... C H W"],
     ):
         batch_shape = proprio_inp.shape[:-1]
 
-        cmd_flat = cmd_inp.reshape(-1, cmd_inp.shape[-1])
+        cmd_flat = cmd_feature_inp.reshape(-1, cmd_feature_inp.shape[-1])
         proprio_flat = proprio_inp.reshape(-1, proprio_inp.shape[-1])
         extero_flat = extero_inp.reshape(-1, *extero_inp.shape[-3:])
 
-        cmd_feature = self.cmd_mlp(cmd_flat)
+        cmd_feature = cmd_flat
         proprio_feature = self.proprio_mlp(proprio_flat)
         extero_feature = self.extero_mlp(extero_flat)
 

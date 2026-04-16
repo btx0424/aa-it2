@@ -86,13 +86,13 @@ class EncoderOne(nn.Module):
 
     def forward(
         self,
-        query_feature_inp: Float[torch.Tensor, "... D"],
+        queries_inp: Float[torch.Tensor, "... D"],
         proprio_inp: Float[torch.Tensor, ".. D"],
         extero_inp: Float[torch.Tensor, ".. C H W"],
     ):
         batch_shape = proprio_inp.shape[:-1]
 
-        query_flat = query_feature_inp.reshape(-1, query_feature_inp.shape[-1])
+        query_flat = queries_inp.reshape(-1, queries_inp.shape[-1])
         proprio_flat = proprio_inp.reshape(-1, proprio_inp.shape[-1])
         extero_flat = extero_inp.reshape(-1, *extero_inp.shape[-3:])
 
@@ -115,7 +115,7 @@ class EncoderOne(nn.Module):
 
 
 class EncoderTwo(nn.Module):
-    """Multi-modal encoder like :class:`EncoderOne`, with an extra command-conditioned step.
+    """Multi-modal encoder like :class:`EncoderOne`, with an extra query-conditioned step.
 
     Pipeline:
 
@@ -129,7 +129,7 @@ class EncoderTwo(nn.Module):
     4. **Aggregate**: concatenate ``query_refined`` with the (post-FFN) proprio and
        extero tokens and linearly project to ``hidden_dim``.
 
-    The cross-attention step lets the command slot explicitly pull task-relevant
+    The cross-attention step lets the query slot explicitly pull task-relevant
     structure from proprioception and exteroception after they have already mixed
     via self-attention.
     """
@@ -164,8 +164,6 @@ class EncoderTwo(nn.Module):
             nn.AdaptiveAvgPool2d(1),
             nn.Flatten(start_dim=1),
         )
-        self.modality_embedding = nn.Parameter(torch.randn(3, token_dim) * 0.02)
-        self.modality_embedding._non_muon = True
 
         self.self_attn = nn.MultiheadAttention(
             embed_dim=token_dim,
@@ -188,47 +186,45 @@ class EncoderTwo(nn.Module):
         self.cross_attn_norm = nn.LayerNorm(token_dim)
 
         self.out_proj = nn.Sequential(
-            nn.LayerNorm(3 * token_dim),
-            nn.Linear(3 * token_dim, hidden_dim),
+            nn.LayerNorm(token_dim),
+            nn.Linear(token_dim, hidden_dim),
             activation(),
         )
         self.output_dim = hidden_dim
 
     def forward(
         self,
-        query_feature_inp: Float[torch.Tensor, "... D"],
+        queries_inp: Float[torch.Tensor, "... M token_dim"],
         proprio_inp: Float[torch.Tensor, "... D"],
         extero_inp: Float[torch.Tensor, "... C H W"],
-    ):
-        batch_shape = proprio_inp.shape[:-1]
+    ) -> Float[torch.Tensor, "... M hidden_dim"]:
+        batch_shape = queries_inp.shape[:-2]
+        N = batch_shape.numel()
+        M = queries_inp.shape[-2]
 
-        query_flat = query_feature_inp.reshape(-1, query_feature_inp.shape[-1])
-        proprio_flat = proprio_inp.reshape(-1, proprio_inp.shape[-1])
-        extero_flat = extero_inp.reshape(-1, *extero_inp.shape[-3:])
+        queries = queries_inp.reshape(N, M, self.token_dim)
+        proprio_flat = proprio_inp.reshape(N, proprio_inp.shape[-1])
+        extero_flat = extero_inp.reshape(N, *extero_inp.shape[-3:])
 
-        query_feature = query_flat
-        proprio_feature = self.proprio_mlp(proprio_flat)
-        extero_feature = self.extero_mlp(extero_flat)
+        proprio_feature = self.proprio_mlp(proprio_flat).reshape(N, 1, self.token_dim)
+        extero_feature = self.extero_mlp(extero_flat).reshape(N, 1, self.token_dim)
 
-        tokens = torch.stack(
-            [query_feature, proprio_feature, extero_feature], dim=1
-        )
-        tokens = tokens + self.modality_embedding.unsqueeze(0)
+        tokens = torch.cat(
+            [queries, proprio_feature, extero_feature], dim=1
+        ) # [N, M + 2, self.token_dim]
 
         with sdpa_kernel(backends=[SDPBackend.MATH]):
             sa_out, _ = self.self_attn(tokens, tokens, tokens, need_weights=False)
         tokens = self.self_attn_norm(tokens + sa_out)
         tokens = tokens + self.ffn(tokens)
 
-        query_token = tokens[:, 0:1, :]
-        proprio_extero = tokens[:, 1:, :]
+        query_token = tokens[:, :-2, :] # [N, M, self.token_dim]
+        proprio_extero = tokens[:, -2:, :] # [N, 2, self.token_dim]
         with sdpa_kernel(backends=[SDPBackend.MATH]):
             cross_out, _ = self.cross_attn(
                 query_token, proprio_extero, proprio_extero, need_weights=False
             )
-        query_refined = self.cross_attn_norm(query_token + cross_out).squeeze(1)
+        query_refined = self.cross_attn_norm(query_token + cross_out) # [N, M, self.token_dim]
 
-        fused = self.out_proj(
-            torch.cat([query_refined, tokens[:, 1], tokens[:, 2]], dim=-1)
-        )
-        return fused.reshape(*batch_shape, self.hidden_dim)
+        fused = self.out_proj(query_refined) # [N, M, self.hidden_dim]
+        return fused.reshape(*batch_shape, M, self.hidden_dim)

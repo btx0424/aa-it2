@@ -39,7 +39,7 @@ from tensordict.nn import (
 )
 
 from hydra.core.config_store import ConfigStore
-from dataclasses import dataclass
+from dataclasses import dataclass, asdict
 from typing import Union, Tuple, Literal
 from collections import OrderedDict
 
@@ -146,10 +146,8 @@ class FuturePredictor(nn.Module):
                 nn.init.orthogonal_(module.weight, 0.02)
                 nn.init.constant_(module.bias, 0.0)
 
-    def forward(
-        self,
-        context: torch.Tensor,
-        target: torch.Tensor | None = None,
+    def _encode_latent(
+        self, context: torch.Tensor, target: torch.Tensor | None
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         if target is None:
             mu = context.new_zeros(*context.shape[:-1], self.latent_dim)
@@ -160,8 +158,85 @@ class FuturePredictor(nn.Module):
             mu, logvar = posterior.chunk(2, dim=-1)
             std = torch.exp(0.5 * logvar)
             z = mu + std * torch.randn_like(std)
+        return z, mu, logvar
+
+    def forward(
+        self,
+        context: torch.Tensor,
+        target: torch.Tensor | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """VAE forward for inference / sampling: returns ``(pred, mu, logvar)``."""
+        z, mu, logvar = self._encode_latent(context, target)
         pred = self.decoder(torch.cat([context, z], dim=-1))
         return pred, mu, logvar
+    
+    def sampling(
+        self,
+        context: torch.Tensor,
+        samples: int,
+    ) -> torch.Tensor:
+        """Draw samples from the decoder prior conditioned on context.
+
+        Args:
+            context: Conditioning feature with shape ``[..., context_dim]``.
+            samples: Number of future samples to draw per context.
+
+        Returns:
+            Tensor of shape ``[..., samples, pred_dim]``.
+        """
+        if samples <= 0:
+            raise ValueError(f"samples must be > 0, got {samples}.")
+
+        context_exp = context.unsqueeze(-2).expand(*context.shape[:-1], samples, context.shape[-1])
+        z = torch.randn(
+            *context.shape[:-1],
+            samples,
+            self.latent_dim,
+            device=context.device,
+            dtype=context.dtype,
+        )
+        pred = self.decoder(torch.cat([context_exp, z], dim=-1))
+        return pred
+
+    def compute_loss(
+        self,
+        context: torch.Tensor,
+        target: torch.Tensor,
+        valid: torch.Tensor,
+        loss_coef: float,
+        kl_coef: float,
+    ) -> tuple[torch.Tensor | None, dict]:
+        """ELBO-style training loss (reconstruction + KL). Uses :meth:`forward` internally."""
+        pred, mu, logvar = self.forward(context, target)
+
+        valid_exp = valid.float()
+        if valid_exp.dim() < pred.dim():
+            valid_exp = valid_exp.unsqueeze(-1)
+        valid_exp = valid_exp.expand_as(pred)
+        weight = valid_exp.sum()
+        if weight.item() == 0:
+            return None, {"skip": True}
+
+        sqerr = ((pred - target).square() * valid_exp).sum()
+        pred_loss = sqerr / weight
+
+        kl_per_sample = -0.5 * (
+            1 + logvar - mu.square() - logvar.exp()
+        ).sum(dim=-1, keepdim=True)
+        valid_kl = valid.float()
+        if valid_kl.dim() < kl_per_sample.dim():
+            valid_kl = valid_kl.unsqueeze(-1)
+        kl_weight = valid_kl.sum()
+        kl_loss = (kl_per_sample * valid_kl).sum() / kl_weight.clamp_min(1.0)
+
+        loss = loss_coef * (pred_loss + kl_coef * kl_loss)
+        meta = {
+            "sqerr": sqerr.detach(),
+            "recon_weight": weight.detach(),
+            "kl_loss": kl_loss.detach(),
+            "kl_weight": kl_weight.detach(),
+        }
+        return loss, meta
 
 
 class PPOPolicy(TensorDictModuleBase):
@@ -322,35 +397,40 @@ class PPOPolicy(TensorDictModuleBase):
         fp = self.future_predictor
         return fp.module if isinstance(fp, DDP) else fp
 
-    def run_policy(self, tensordict: TensorDict, actor: bool=False, critic: bool=False) -> TensorDict:
+    def run_policy(
+        self,
+        tensordict: TensorDict,
+        actor: bool=False,
+        critic: bool=False,
+        future_prediction: bool=False,
+    ) -> TensorDict:
         tensordict = self.vecnorm(tensordict)
         tensordict = self.cmd_feature_encoder(tensordict)
-        feature = self.fusion_encoder(
-            query_feature_inp=tensordict["_cmd_feature"],
-            proprio_inp=tensordict["_obs_normed"],
-            extero_inp=tensordict["_extero_normed"],
-        )
-        tensordict["_shared_feature"] = feature
+        if future_prediction:
+            emb = self._future_predictor_unwrapped.query_embedding.expand(
+                *tensordict.shape, -1
+            )
+            query = torch.stack([tensordict["_cmd_feature"], emb], dim=-2)
+            feature = self.fusion_encoder(query, tensordict["_obs_normed"], tensordict["_extero_normed"])
+            tensordict["_shared_feature"] = feature[..., 0, :]
+            tensordict["_future_feature"] = feature[..., 1, :]
+        else:
+            query = tensordict["_cmd_feature"].unsqueeze(-2)
+            feature = self.fusion_encoder(query, tensordict["_obs_normed"], tensordict["_extero_normed"])
+            tensordict["_shared_feature"] = feature.squeeze(-2)
         if actor:
             tensordict = self.actor(tensordict)
         if critic:
             tensordict = self.critic(tensordict)
+        if future_prediction:
+            pred, mu, logvar = self.future_predictor(
+                tensordict["_future_feature"],
+                tensordict["_future_target"]
+            )
+            tensordict["_future_pred"] = pred
+            tensordict["_future_mu"] = mu
+            tensordict["_future_logvar"] = logvar
         return tensordict
-    
-    def run_future_prediction(
-        self, tensordict: TensorDict, target: torch.Tensor | None = None
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """Query the fusion encoder with the query embedding and decode a VAE sample."""
-        tensordict = self.vecnorm(tensordict)
-        query_embedding = self._future_predictor_unwrapped.query_embedding.expand(
-            *tensordict.shape, -1
-        )
-        feature = self.fusion_encoder(
-            query_feature_inp=query_embedding,
-            proprio_inp=tensordict["_obs_normed"],
-            extero_inp=tensordict["_extero_normed"],
-        )
-        return self.future_predictor(feature, target)
     
     def _configure_optimizers(self):
         if self.cfg.muon:
@@ -385,7 +465,14 @@ class PPOPolicy(TensorDictModuleBase):
         self.prev_tensordict = None
 
     def get_rollout_policy(self, mode: str="train", critic: bool=False):
-        policy = functools.partial(self.run_policy, actor=True, critic=critic)
+        if mode == "train":
+            policy = functools.partial(self.run_policy, actor=True, critic=critic)
+        elif mode == "eval" and self.cfg.stages[0] == "future":
+            def policy(tensordict: TensorDict):
+                self.run_policy(tensordict, actor=True, critic=False, future_prediction=True)
+                positions = tensordict["_future_pred"][..., :3]
+                tensordict["future_traj"] = positions
+                return tensordict
         if self.cfg.compile:
             policy = torch.compile(policy)
         return policy
@@ -396,7 +483,8 @@ class PPOPolicy(TensorDictModuleBase):
 
         infos = {}
         tensordict = tensordict.exclude("stats", ("next", "stats"))
-        infos.update(self.train_policy(tensordict))
+        if not self._future_enabled:
+            infos.update(self.train_policy(tensordict))
 
         if (
             self._future_enabled
@@ -437,31 +525,25 @@ class PPOPolicy(TensorDictModuleBase):
         total_sqerr = target.new_zeros(())
         total_kl_weighted = target.new_zeros(())
         for minibatch in make_batch(future_td, self.cfg.future_pred_minibatches):
-            pred, mu, logvar = self.run_future_prediction(minibatch, minibatch["_future_target"])
-            valid = minibatch["_future_valid"].float()
-            weight = valid.sum()
-            if weight.item() == 0:
-                continue
-            sqerr = ((pred - minibatch["_future_target"]).square() * valid).sum()
-            pred_loss = sqerr / weight
-            kl_per_sample = -0.5 * (
-                1 + logvar - mu.square() - logvar.exp()
-            ).sum(dim=-1, keepdim=True)
-            valid_sample = minibatch["_future_valid"].float()
-            kl_weight = valid_sample.sum()
-            kl_loss = (kl_per_sample * valid_sample).sum() / kl_weight.clamp_min(1.0)
-            loss = self.cfg.future_pred_coef * (
-                pred_loss + self.cfg.future_kl_coef * kl_loss
+            self.run_policy(minibatch, future_prediction=True)
+            loss, meta = self.future_predictor.compute_loss(
+                minibatch["_future_feature"],
+                minibatch["_future_target"],
+                minibatch["_future_valid"],
+                self.cfg.future_pred_coef,
+                self.cfg.future_kl_coef,
             )
+            if meta.get("skip"):
+                continue
 
             self.opt_future.zero_grad(set_to_none=True)
             loss.backward()
             if aa.is_distributed() and not self.cfg.use_ddp:
                 allreduce_grads(self.future_predictor.parameters())
             self.opt_future.step()
-            total_weight += weight.detach()
-            total_sqerr += sqerr.detach()
-            total_kl_weighted += (kl_loss.detach() * kl_weight.detach())
+            total_weight += meta["recon_weight"]
+            total_sqerr += meta["sqerr"]
+            total_kl_weighted += meta["kl_loss"] * meta["kl_weight"]
 
         self.fusion_encoder.requires_grad_(True)
         pred_loss = total_sqerr / total_weight.clamp_min(1.0)
@@ -473,6 +555,12 @@ class PPOPolicy(TensorDictModuleBase):
         }
 
     def train_policy(self, tensordict: TensorDict):
+        if hasattr(self, "prev_cfg") and self.prev_cfg.muon != self.cfg.muon:
+            raise RuntimeError(
+                "Muon optimizer setting must be consistent across runs/checkpoints: "
+                f"checkpoint muon={self.prev_cfg.muon}, current muon={self.cfg.muon}."
+            )
+        
         infos = []
         self._compute_advantage(tensordict, "adv", "ret")
         action = tensordict[ACTION_KEY]
@@ -641,6 +729,7 @@ class PPOPolicy(TensorDictModuleBase):
             if isinstance(module, DDP):
                 module = module.module
             state_dict[name] = module.state_dict()
+        state_dict["cfg"] = asdict(self.cfg)
         return state_dict
     
     def load_state_dict(self, state_dict, strict=True):
@@ -657,6 +746,8 @@ class PPOPolicy(TensorDictModuleBase):
                 warnings.warn(f"Failed to load state dict for {name}: {str(e)}")
                 failed_keys.append(name)
         print(f"Successfully loaded {succeed_keys}.")
+        if "cfg" in state_dict:
+            self.prev_cfg = PPOConfig(**state_dict["cfg"])
         return failed_keys
 
 

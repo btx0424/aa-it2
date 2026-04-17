@@ -98,6 +98,7 @@ class PPOConfig:
     future_pred_minibatches: int = 4
     future_latent_dim: int = 16
     future_kl_coef: float = 0.05
+    future_prior_kl_coef: float = 0.5
     stages: Tuple[str, ...] = ("policy", "future")
 
 
@@ -396,6 +397,7 @@ class PPOPolicy(TensorDictModuleBase):
         total_weight = target.new_zeros(())
         total_sqerr = target.new_zeros(())
         total_kl_weighted = target.new_zeros(())
+        total_kl_prior_weighted = target.new_zeros(())
         total_latent_ig = target.new_zeros(())
         for minibatch in make_batch(future_td, self.cfg.future_pred_minibatches):
             self.run_policy(minibatch, future_prediction=True)
@@ -404,6 +406,7 @@ class PPOPolicy(TensorDictModuleBase):
                 minibatch["_extero_context"],
                 minibatch["_future_target"],
                 self.cfg.future_kl_coef,
+                prior_kl_coef=self.cfg.future_prior_kl_coef,
                 valid_mask=minibatch.get("_future_valid"),
             )
 
@@ -415,17 +418,20 @@ class PPOPolicy(TensorDictModuleBase):
             total_weight += meta["recon_weight"]
             total_sqerr += meta["sqerr"]
             total_kl_weighted += meta["kl_loss"] * meta["kl_weight"]
+            total_kl_prior_weighted += meta["kl_prior_loss"] * meta["kl_weight"]
             total_latent_ig += meta["latent_ig"] * meta["recon_weight"]
 
         self.fusion_encoder.requires_grad_(True)
         pred_loss = total_sqerr / total_weight.clamp_min(1.0)
         kl_loss = total_kl_weighted / valid_mask.float().sum().clamp_min(1.0)
+        kl_prior_loss = total_kl_prior_weighted / valid_mask.float().sum().clamp_min(1.0)
         latent_ig = total_latent_ig / total_weight.clamp_min(1.0)
         param_diff = check_parameters(self.future_predictor)
         return {
-            "future/param_diff": param_diff.item(),
+            "future/param_diff": param_diff,
             "future/pred_loss": pred_loss.detach().item(),
-            "future/kl_loss": kl_loss.detach().item(),
+            "future/KL(q(z|o_ext,y)||p(z|o_ext))": kl_loss.detach().item(),
+            "future/KL(p(z|o_ext)||p(z|o_pro))": kl_prior_loss.detach().item(),
             "future/latent_ig": latent_ig.detach().item(),
             "future/valid_ratio": valid_mask.float().mean().detach().item(),
         }

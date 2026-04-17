@@ -17,7 +17,12 @@ def kl_gaussian(
 
     Sum over the last dimension.
     """
-    return 0.5 * (logvar_p - logvar_q + (torch.exp(logvar_q) + (mu_q - mu_p) ** 2) / torch.exp(logvar_p) - 1).sum(dim=-1)
+    return 0.5 * (
+        logvar_p
+        - logvar_q
+        + (torch.exp(logvar_q) + (mu_q - mu_p) ** 2) / torch.exp(logvar_p)
+        - 1
+    ).sum(dim=-1)
 
 
 def maybe_unwrap(module: nn.Module):
@@ -27,8 +32,7 @@ def maybe_unwrap(module: nn.Module):
 
 
 class FuturePredictor(nn.Module):
-    """Conditional VAE-style predictor for multi-modal future targets.
-    """
+    """Conditional VAE-style predictor for multi-modal future targets."""
 
     def __init__(
         self,
@@ -79,13 +83,13 @@ class FuturePredictor(nn.Module):
             if isinstance(module, nn.Linear):
                 nn.init.orthogonal_(module.weight, 0.02)
                 nn.init.constant_(module.bias, 0.0)
-    
+
     def wrap_DDP(self, device_ids: list[int]):
         self.query_embedding = DDP(self.query_embedding, device_ids=device_ids)
         self.prior = DDP(self.prior, device_ids=device_ids)
         self.posterior = DDP(self.posterior, device_ids=device_ids)
         self.decoder = DDP(self.decoder, device_ids=device_ids)
-    
+
     def state_dict(self):
         state_dict = OrderedDict()
         state_dict["query_embedding"] = maybe_unwrap(self.query_embedding).state_dict()
@@ -93,12 +97,16 @@ class FuturePredictor(nn.Module):
         state_dict["posterior"] = maybe_unwrap(self.posterior).state_dict()
         state_dict["decoder"] = maybe_unwrap(self.decoder).state_dict()
         return state_dict
-    
-    def load_state_dict(self, state_dict: OrderedDict):
-        maybe_unwrap(self.query_embedding).load_state_dict(state_dict["query_embedding"])
-        maybe_unwrap(self.prior).load_state_dict(state_dict["prior"])
-        maybe_unwrap(self.posterior).load_state_dict(state_dict["posterior"])
-        maybe_unwrap(self.decoder).load_state_dict(state_dict["decoder"])
+
+    def load_state_dict(self, state_dict: OrderedDict, strict: bool = True):
+        maybe_unwrap(self.query_embedding).load_state_dict(
+            state_dict["query_embedding"], strict=strict
+        )
+        maybe_unwrap(self.prior).load_state_dict(state_dict["prior"], strict=strict)
+        maybe_unwrap(self.posterior).load_state_dict(
+            state_dict["posterior"], strict=strict
+        )
+        maybe_unwrap(self.decoder).load_state_dict(state_dict["decoder"], strict=strict)
 
     def forward(
         self,
@@ -110,7 +118,7 @@ class FuturePredictor(nn.Module):
         z = mu + torch.randn_like(mu) * torch.exp(logvar * 0.5)
         pred = self.decoder(torch.cat([context, z], dim=-1))
         return pred, z
-    
+
     def sample_prior(
         self,
         context: torch.Tensor,
@@ -150,30 +158,42 @@ class FuturePredictor(nn.Module):
         extero_context: torch.Tensor,
         target: torch.Tensor,
         kl_coef: float,
+        prior_kl_coef: float = 0.5,
         valid_mask: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, dict]:
-        """ELBO: recon with ``z ~ q``, plus ``KL(q(z|o_ext,y) ‖ p(z|o_pro))``.
+        """ELBO-style loss: recon with ``z ~ q``, ``KL(q ‖ p(z|o_ext))``, and ``prior_kl_coef * KL(p_ext ‖ p_pro)``.
 
-        ``extero_context`` is the fusion token that may already subsume proprio; the prior stays on the
-        proprio-only token so this KL compares proprio-only belief to the (extero + target) posterior.
+        - ``kl_posterior`` is ``KL(q(z|o_ext,y) ‖ p(z|o_ext))`` with ``o``.
+        - ``kl_prior`` is ``KL(p(z|o_ext) ‖ p(z|o_pro))`` with extero moments detached so gradients align ``p(z|o_pro)`` toward ``p(z|o_ext)``.
 
-        ``meta["latent_ig"]`` is the minibatch mean of that KL (nats), summed over latent dims per transition.
+        ``meta["latent_ig"]`` is the minibatch mean of ``kl_prior`` (prior-shift / IG-flavored term).
         """
         proprio_mu, proprio_logvar = self.prior(proprio_context).chunk(2, dim=-1)
+        extero_mu, extero_logvar = self.prior(extero_context).chunk(2, dim=-1)
 
         posterior_in = torch.cat([extero_context, target], dim=-1)
         posterior_mu, posterior_logvar = self.posterior(posterior_in).chunk(2, dim=-1)
 
-        kl = kl_gaussian(
+        kl_posterior = kl_gaussian(
             posterior_mu,
             posterior_logvar,
+            extero_mu,
+            extero_logvar,
+        )
+        kl_prior = kl_gaussian(
+            extero_mu.detach(),
+            extero_logvar.detach(),
             proprio_mu,
             proprio_logvar,
         )
 
-        z = posterior_mu + torch.randn_like(posterior_mu) * torch.exp(posterior_logvar * 0.5)
+        z = posterior_mu + torch.randn_like(posterior_mu) * torch.exp(
+            posterior_logvar * 0.5
+        )
         pred = self.decoder(torch.cat([extero_context, z], dim=-1))
         likelihood = F.mse_loss(pred, target, reduction="none").sum(dim=-1)
+
+        per_term = likelihood + kl_coef * kl_posterior + prior_kl_coef * kl_prior
 
         if valid_mask is not None:
             maskf = valid_mask.to(dtype=likelihood.dtype)
@@ -181,26 +201,28 @@ class FuturePredictor(nn.Module):
                 maskf = maskf.squeeze(-1)
             maskf = maskf.reshape_as(likelihood)
             denom = maskf.sum().clamp_min(1.0)
-            loss = ((likelihood + kl_coef * kl) * maskf).sum() / denom
+            loss = (per_term * maskf).sum() / denom
             recon_weight = maskf.sum()
             sqerr = (likelihood * maskf).sum()
-            kl_sum = (kl * maskf).sum()
-            latent_ig_mean = kl_sum / denom
+            kl_sum = (kl_posterior * maskf).sum()
+            kl_prior_sum = (kl_prior * maskf).sum()
+            latent_ig_mean = kl_prior_sum / denom
         else:
-            loss = (likelihood + kl_coef * kl).mean()
+            loss = per_term.mean()
             n = float(likelihood.numel())
             recon_weight = likelihood.new_tensor(n)
             sqerr = likelihood.sum()
-            kl_sum = kl.sum()
-            latent_ig_mean = kl.mean()
+            kl_sum = kl_posterior.sum()
+            kl_prior_sum = kl_prior.sum()
+            latent_ig_mean = kl_prior.mean()
 
+        w = kl_posterior.new_tensor(1.0)
         meta = {
             "recon_weight": recon_weight,
             "sqerr": sqerr,
             "kl_loss": kl_sum,
-            "kl_weight": kl.new_tensor(1.0),
-            # Mean KL(q(z|o_pro,o_ext,y) ‖ p(z|o_pro)) on this minibatch (nats / latent-dim sum per transition).
+            "kl_prior_loss": kl_prior_sum,
+            "kl_weight": w,
             "latent_ig": latent_ig_mean.detach(),
         }
         return loss, meta
-

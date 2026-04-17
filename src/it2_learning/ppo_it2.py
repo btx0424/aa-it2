@@ -119,7 +119,7 @@ class PPOPolicy(TensorDictModuleBase):
     ):
         super().__init__()
         self.cfg = PPOConfig(**cfg)
-        self.device = device
+        self.device = torch.device(device)
 
         self.entropy_coef = self.cfg.entropy_coef
         self.max_grad_norm = 1.0
@@ -212,44 +212,8 @@ class PPOPolicy(TensorDictModuleBase):
         self.critic.apply(init_)
 
         if aa.is_distributed():
-            if self.cfg.use_ddp:
-                local_rank = aa.get_local_rank()
-                self.fusion_encoder = DDP(self.fusion_encoder, device_ids=[local_rank])
-                self.cmd_feature_encoder = DDP(self.cmd_feature_encoder, device_ids=[local_rank])
-                self.future_predictor.wrap_DDP(device_ids=[local_rank])
-                self.actor = DDP(self.actor, device_ids=[local_rank])
-                self.critic = DDP(self.critic, device_ids=[local_rank])
-            else:
-                for param in self.fusion_encoder.parameters():
-                    distr.broadcast(param, src=0)
-                for param in self.cmd_feature_encoder.parameters():
-                    distr.broadcast(param, src=0)
-                for param in self.future_predictor.parameters():
-                    distr.broadcast(param, src=0)
-                for param in self.actor.parameters():
-                    distr.broadcast(param, src=0)
-                for param in self.critic.parameters():
-                    distr.broadcast(param, src=0)
-            self.world_size = aa.get_world_size()
+            self._configure_distributed()
         self._configure_optimizers()
-
-        _dev = torch.device(device) if not isinstance(device, torch.device) else device
-        if self.cfg.use_amp and _dev.type != "cuda":
-            warnings.warn(
-                "PPOConfig.use_amp=True requires a CUDA device; mixed precision disabled.",
-                UserWarning,
-                stacklevel=2,
-            )
-        self._amp_enabled = bool(self.cfg.use_amp) and _dev.type == "cuda"
-        if self._amp_enabled:
-            self._amp_dtype = (
-                torch.bfloat16
-                if torch.cuda.is_bf16_supported()
-                else torch.float16
-            )
-        else:
-            self._amp_dtype = torch.float32
-        self._scaler = torch.amp.GradScaler("cuda", enabled=self._amp_enabled)
 
         self.update = self._update
         # if self.cfg.compile and not aa.is_distributed():
@@ -258,11 +222,6 @@ class PPOPolicy(TensorDictModuleBase):
         #     # self.update = CudaGraphModule(self.update)
         self.prev_tensordict = None
         self._future_enabled = False
-
-    @property
-    def _future_predictor_unwrapped(self) -> FuturePredictor:
-        fp = self.future_predictor
-        return fp.module if isinstance(fp, DDP) else fp
 
     def run_policy(
         self,
@@ -276,7 +235,7 @@ class PPOPolicy(TensorDictModuleBase):
         tensordict = self.cmd_feature_encoder(tensordict)
         cmd = tensordict["_cmd_feature"].reshape(N, 1, -1)
         if future_prediction:
-            future_query = self._future_predictor_unwrapped.query_embedding
+            future_query = self.future_predictor.query_embedding(torch.arange(2, device=self.device))
             future_query = future_query.expand(N, 2, -1)
             query = torch.cat([cmd, future_query], dim=-2) # [N, 3, token_dim]
             feature = EncoderTwo.forward_policy_future(
@@ -302,6 +261,27 @@ class PPOPolicy(TensorDictModuleBase):
         if critic:
             tensordict = self.critic(tensordict)
         return tensordict
+    
+    def _configure_distributed(self):
+        if self.cfg.use_ddp:
+            local_rank = aa.get_local_rank()
+            self.fusion_encoder = DDP(self.fusion_encoder, device_ids=[local_rank])
+            self.cmd_feature_encoder = DDP(self.cmd_feature_encoder, device_ids=[local_rank])
+            self.future_predictor.wrap_DDP(device_ids=[local_rank])
+            self.actor = DDP(self.actor, device_ids=[local_rank])
+            self.critic = DDP(self.critic, device_ids=[local_rank])
+        else:
+            for param in self.fusion_encoder.parameters():
+                distr.broadcast(param, src=0)
+            for param in self.cmd_feature_encoder.parameters():
+                distr.broadcast(param, src=0)
+            for param in self.future_predictor.parameters():
+                distr.broadcast(param, src=0)
+            for param in self.actor.parameters():
+                distr.broadcast(param, src=0)
+            for param in self.critic.parameters():
+                distr.broadcast(param, src=0)
+        self.world_size = aa.get_world_size()
     
     def _configure_optimizers(self):
         if self.cfg.muon:
@@ -329,6 +309,23 @@ class PPOPolicy(TensorDictModuleBase):
             lr=self.cfg.lr,
             weight_decay=0.01,
         )
+
+        if self.cfg.use_amp and self.device.type != "cuda":
+            warnings.warn(
+                "PPOConfig.use_amp=True requires a CUDA device; mixed precision disabled.",
+                UserWarning,
+                stacklevel=2,
+            )
+        self._amp_enabled = bool(self.cfg.use_amp) and self.device.type == "cuda"
+        if self._amp_enabled:
+            self._amp_dtype = (
+                torch.bfloat16
+                if torch.cuda.is_bf16_supported()
+                else torch.float16
+            )
+        else:
+            self._amp_dtype = torch.float32
+        self._scaler = torch.amp.GradScaler("cuda", enabled=self._amp_enabled)
 
     def on_stage_start(self, stage: str):
         self._future_enabled = (stage == "future")
@@ -426,11 +423,11 @@ class PPOPolicy(TensorDictModuleBase):
         latent_ig = total_latent_ig / total_weight.clamp_min(1.0)
         param_diff = check_parameters(self.future_predictor)
         return {
-            "future/param_diff": param_diff,
-            "future/pred_loss": pred_loss.detach(),
-            "future/kl_loss": kl_loss.detach(),
-            "future/latent_ig": latent_ig.detach(),
-            "future/valid_ratio": valid_mask.float().mean().detach(),
+            "future/param_diff": param_diff.item(),
+            "future/pred_loss": pred_loss.detach().item(),
+            "future/kl_loss": kl_loss.detach().item(),
+            "future/latent_ig": latent_ig.detach().item(),
+            "future/valid_ratio": valid_mask.float().mean().detach().item(),
         }
 
     def train_policy(self, tensordict: TensorDict):

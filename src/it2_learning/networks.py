@@ -20,6 +20,12 @@ def kl_gaussian(
     return 0.5 * (logvar_p - logvar_q + (torch.exp(logvar_q) + (mu_q - mu_p) ** 2) / torch.exp(logvar_p) - 1).sum(dim=-1)
 
 
+def maybe_unwrap(module: nn.Module):
+    if isinstance(module, DDP):
+        module = module.module
+    return module
+
+
 class FuturePredictor(nn.Module):
     """Conditional VAE-style predictor for multi-modal future targets.
     """
@@ -35,8 +41,11 @@ class FuturePredictor(nn.Module):
         self.pred_dim = pred_dim
         self.latent_dim = latent_dim
 
-        self.query_embedding = nn.Parameter(torch.randn(2, context_dim) * 0.02)
-        self.query_embedding._non_muon = True
+        # self.query_embedding = nn.Parameter(torch.randn(2, context_dim) * 0.02)
+        # self.query_embedding._non_muon = True
+        self.query_embedding = nn.Embedding(2, context_dim)
+        self.query_embedding.weight._non_muon = True
+
         self.prior = nn.Sequential(
             nn.Linear(context_dim, 256),
             nn.SiLU(),
@@ -65,16 +74,31 @@ class FuturePredictor(nn.Module):
 
     def reset_parameters(self):
         with torch.no_grad():
-            self.query_embedding.normal_(0.0, 0.02)
+            self.query_embedding.weight.data.normal_(0.0, 0.02)
         for module in self.modules():
             if isinstance(module, nn.Linear):
                 nn.init.orthogonal_(module.weight, 0.02)
                 nn.init.constant_(module.bias, 0.0)
     
     def wrap_DDP(self, device_ids: list[int]):
-        self.ddp_prior = DDP(self.prior, device_ids=device_ids)
-        self.ddp_posterior = DDP(self.posterior, device_ids=device_ids)
-        self.ddp_decoder = DDP(self.decoder, device_ids=device_ids)
+        self.query_embedding = DDP(self.query_embedding, device_ids=device_ids)
+        self.prior = DDP(self.prior, device_ids=device_ids)
+        self.posterior = DDP(self.posterior, device_ids=device_ids)
+        self.decoder = DDP(self.decoder, device_ids=device_ids)
+    
+    def state_dict(self):
+        state_dict = OrderedDict()
+        state_dict["query_embedding"] = maybe_unwrap(self.query_embedding).state_dict()
+        state_dict["prior"] = maybe_unwrap(self.prior).state_dict()
+        state_dict["posterior"] = maybe_unwrap(self.posterior).state_dict()
+        state_dict["decoder"] = maybe_unwrap(self.decoder).state_dict()
+        return state_dict
+    
+    def load_state_dict(self, state_dict: OrderedDict):
+        maybe_unwrap(self.query_embedding).load_state_dict(state_dict["query_embedding"])
+        maybe_unwrap(self.prior).load_state_dict(state_dict["prior"])
+        maybe_unwrap(self.posterior).load_state_dict(state_dict["posterior"])
+        maybe_unwrap(self.decoder).load_state_dict(state_dict["decoder"])
 
     def forward(
         self,

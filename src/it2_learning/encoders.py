@@ -197,6 +197,8 @@ class EncoderTwo(nn.Module):
         queries_inp: Float[torch.Tensor, "... M token_dim"],
         proprio_inp: Float[torch.Tensor, "... D"],
         extero_inp: Float[torch.Tensor, "... C H W"],
+        attn_mask_self: torch.Tensor | None = None,
+        attn_mask_cross: torch.Tensor | None = None,
     ) -> Float[torch.Tensor, "... M hidden_dim"]:
         batch_shape = queries_inp.shape[:-2]
         N = batch_shape.numel()
@@ -214,7 +216,13 @@ class EncoderTwo(nn.Module):
         ) # [N, M + 2, self.token_dim]
 
         with sdpa_kernel(backends=[SDPBackend.MATH]):
-            sa_out, _ = self.self_attn(tokens, tokens, tokens, need_weights=False)
+            sa_out, _ = self.self_attn(
+                tokens,
+                tokens,
+                tokens,
+                attn_mask=attn_mask_self,
+                need_weights=False,
+            )
         tokens = self.self_attn_norm(tokens + sa_out)
         tokens = tokens + self.ffn(tokens)
 
@@ -222,9 +230,62 @@ class EncoderTwo(nn.Module):
         proprio_extero = tokens[:, -2:, :] # [N, 2, self.token_dim]
         with sdpa_kernel(backends=[SDPBackend.MATH]):
             cross_out, _ = self.cross_attn(
-                query_token, proprio_extero, proprio_extero, need_weights=False
+                query_token,
+                proprio_extero,
+                proprio_extero,
+                attn_mask=attn_mask_cross,
+                need_weights=False,
             )
         query_refined = self.cross_attn_norm(query_token + cross_out) # [N, M, self.token_dim]
 
         fused = self.out_proj(query_refined) # [N, M, self.hidden_dim]
         return fused.reshape(*batch_shape, M, self.hidden_dim)
+
+    def forward_policy(
+        self,
+        policy_query: Float[torch.Tensor, "... 1 token_dim"],
+        proprio_inp: Float[torch.Tensor, "... D"],
+        extero_inp: Float[torch.Tensor, "... C H W"],
+    ) -> Float[torch.Tensor, "... hidden_dim"]:
+        return self(policy_query, proprio_inp, extero_inp)
+    
+    def forward_policy_future(
+        self,
+        queries: Float[torch.Tensor, "... 3 token_dim"],
+        proprio_inp: Float[torch.Tensor, "... D"],
+        extero_inp: Float[torch.Tensor, "... C H W"],
+    ) -> Float[torch.Tensor, "... 3 hidden_dim"]:
+        M = queries.shape[-2]
+        assert M == 3, f"EncoderTwo.compute_policy_future_feature expects M==3, got M={M}."
+
+        # Token layout after concat: [q0, q1, q2, proprio, extero] -> indices [0..4]
+        # KEEP THIS COMMENT: in this case, we construct the attn_mask so that:
+        # 1. each query does not attend to other queries
+        # 2. the prior query[..., 1, :] attends to only the proprio token (index 3)
+        # 3. the posterior query[..., 2, :] attends to both proprio and extero tokens (indices 3 and 4)
+        attn_mask_self = torch.zeros(5, 5, dtype=torch.bool, device=queries.device)
+        # block query-to-query off-diagonal
+        attn_mask_self[:3, :3] = ~torch.eye(3, dtype=torch.bool, device=queries.device)
+
+        # prior query row (index 1): only proprio (col 3) allowed
+        attn_mask_self[1, :] = True
+        attn_mask_self[1, 3] = False
+
+        # posterior query row (index 2): proprio (col 3) and extero (col 4) allowed
+        attn_mask_self[2, :] = True
+        attn_mask_self[2, 3] = False
+        attn_mask_self[2, 4] = False
+
+        attn_mask_cross = torch.tensor([
+            [False, False], # policy query sees both proprio and extero
+            [False, True], # prior query sees only proprio
+            [False, False], # posterior query sees both proprio and extero
+        ], dtype=torch.bool, device=queries.device)
+
+        return self(
+            queries,
+            proprio_inp,
+            extero_inp,
+            attn_mask_self=attn_mask_self,
+            attn_mask_cross=attn_mask_cross,
+        )

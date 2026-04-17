@@ -57,6 +57,7 @@ from active_adaptation.utils.math import (
 )
 from active_adaptation.learning.utils.opt import MuonAdamWWrapper
 from active_adaptation.learning.utils.distributed import check_parameters
+from active_adaptation.utils.profiling import ScopedTimer
 from active_adaptation.learning.ppo.common import (
     make_batch,
     Actor,
@@ -66,6 +67,7 @@ from active_adaptation.learning.ppo.common import (
     CMD_KEY, OBS_KEY, ACTION_KEY, REWARD_KEY, TERM_KEY, DONE_KEY,
 )
 from it2_learning.encoders import EncoderOne, EncoderTwo
+from it2_learning.networks import FuturePredictor
 
 import active_adaptation as aa
 import torch.distributed as distr
@@ -102,141 +104,6 @@ class PPOConfig:
 cs = ConfigStore.instance()
 cs.store("ppo_it2", node=PPOConfig(stages=("policy",)), group="algo")
 cs.store("ppo_it2_future", node=PPOConfig(stages=("future",), future_pred_coef=1.0), group="algo")
-
-
-class FuturePredictor(nn.Module):
-    """Conditional VAE-style predictor for multi-modal future targets."""
-
-    def __init__(
-        self,
-        context_dim: int,
-        pred_dim: int,
-        latent_dim: int,
-    ):
-        super().__init__()
-        self.context_dim = context_dim
-        self.pred_dim = pred_dim
-        self.latent_dim = latent_dim
-
-        self.query_embedding = nn.Parameter(torch.randn(context_dim) * 0.02)
-        self.query_embedding._non_muon = True
-        self.posterior = nn.Sequential(
-            nn.Linear(context_dim + pred_dim, 256),
-            nn.SiLU(),
-            nn.LayerNorm(256),
-            nn.Linear(256, 256),
-            nn.SiLU(),
-            nn.Linear(256, 2 * latent_dim),
-        )
-        self.decoder = nn.Sequential(
-            nn.Linear(context_dim + latent_dim, 256),
-            nn.SiLU(),
-            nn.LayerNorm(256),
-            nn.Linear(256, 256),
-            nn.SiLU(),
-            nn.Linear(256, pred_dim),
-        )
-        self.reset_parameters()
-
-    def reset_parameters(self):
-        with torch.no_grad():
-            self.query_embedding.normal_(0.0, 0.02)
-        for module in self.modules():
-            if isinstance(module, nn.Linear):
-                nn.init.orthogonal_(module.weight, 0.02)
-                nn.init.constant_(module.bias, 0.0)
-
-    def _encode_latent(
-        self, context: torch.Tensor, target: torch.Tensor | None
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        if target is None:
-            mu = context.new_zeros(*context.shape[:-1], self.latent_dim)
-            logvar = torch.zeros_like(mu)
-            z = torch.randn_like(mu)
-        else:
-            posterior = self.posterior(torch.cat([context, target], dim=-1))
-            mu, logvar = posterior.chunk(2, dim=-1)
-            std = torch.exp(0.5 * logvar)
-            z = mu + std * torch.randn_like(std)
-        return z, mu, logvar
-
-    def forward(
-        self,
-        context: torch.Tensor,
-        target: torch.Tensor | None = None,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """VAE forward for inference / sampling: returns ``(pred, mu, logvar)``."""
-        z, mu, logvar = self._encode_latent(context, target)
-        pred = self.decoder(torch.cat([context, z], dim=-1))
-        return pred, mu, logvar
-    
-    def sampling(
-        self,
-        context: torch.Tensor,
-        samples: int,
-    ) -> torch.Tensor:
-        """Draw samples from the decoder prior conditioned on context.
-
-        Args:
-            context: Conditioning feature with shape ``[..., context_dim]``.
-            samples: Number of future samples to draw per context.
-
-        Returns:
-            Tensor of shape ``[..., samples, pred_dim]``.
-        """
-        if samples <= 0:
-            raise ValueError(f"samples must be > 0, got {samples}.")
-
-        context_exp = context.unsqueeze(-2).expand(*context.shape[:-1], samples, context.shape[-1])
-        z = torch.randn(
-            *context.shape[:-1],
-            samples,
-            self.latent_dim,
-            device=context.device,
-            dtype=context.dtype,
-        )
-        pred = self.decoder(torch.cat([context_exp, z], dim=-1))
-        return pred
-
-    def compute_loss(
-        self,
-        context: torch.Tensor,
-        target: torch.Tensor,
-        valid: torch.Tensor,
-        loss_coef: float,
-        kl_coef: float,
-    ) -> tuple[torch.Tensor | None, dict]:
-        """ELBO-style training loss (reconstruction + KL). Uses :meth:`forward` internally."""
-        pred, mu, logvar = self.forward(context, target)
-
-        valid_exp = valid.float()
-        if valid_exp.dim() < pred.dim():
-            valid_exp = valid_exp.unsqueeze(-1)
-        valid_exp = valid_exp.expand_as(pred)
-        weight = valid_exp.sum()
-        if weight.item() == 0:
-            return None, {"skip": True}
-
-        sqerr = ((pred - target).square() * valid_exp).sum()
-        pred_loss = sqerr / weight
-
-        kl_per_sample = -0.5 * (
-            1 + logvar - mu.square() - logvar.exp()
-        ).sum(dim=-1, keepdim=True)
-        valid_kl = valid.float()
-        if valid_kl.dim() < kl_per_sample.dim():
-            valid_kl = valid_kl.unsqueeze(-1)
-        kl_weight = valid_kl.sum()
-        kl_loss = (kl_per_sample * valid_kl).sum() / kl_weight.clamp_min(1.0)
-
-        loss = loss_coef * (pred_loss + kl_coef * kl_loss)
-        meta = {
-            "sqerr": sqerr.detach(),
-            "recon_weight": weight.detach(),
-            "kl_loss": kl_loss.detach(),
-            "kl_weight": kl_weight.detach(),
-        }
-        return loss, meta
 
 
 class PPOPolicy(TensorDictModuleBase):
@@ -349,7 +216,7 @@ class PPOPolicy(TensorDictModuleBase):
                 local_rank = aa.get_local_rank()
                 self.fusion_encoder = DDP(self.fusion_encoder, device_ids=[local_rank])
                 self.cmd_feature_encoder = DDP(self.cmd_feature_encoder, device_ids=[local_rank])
-                self.future_predictor = DDP(self.future_predictor, device_ids=[local_rank])
+                self.future_predictor.wrap_DDP(device_ids=[local_rank])
                 self.actor = DDP(self.actor, device_ids=[local_rank])
                 self.critic = DDP(self.critic, device_ids=[local_rank])
             else:
@@ -404,32 +271,36 @@ class PPOPolicy(TensorDictModuleBase):
         critic: bool=False,
         future_prediction: bool=False,
     ) -> TensorDict:
+        N = tensordict.shape[0]
         tensordict = self.vecnorm(tensordict)
         tensordict = self.cmd_feature_encoder(tensordict)
+        cmd = tensordict["_cmd_feature"].reshape(N, 1, -1)
         if future_prediction:
-            emb = self._future_predictor_unwrapped.query_embedding.expand(
-                *tensordict.shape, -1
+            future_query = self._future_predictor_unwrapped.query_embedding
+            future_query = future_query.expand(N, 2, -1)
+            query = torch.cat([cmd, future_query], dim=-2) # [N, 3, token_dim]
+            feature = EncoderTwo.forward_policy_future(
+                self.fusion_encoder,
+                query,
+                tensordict["_obs_normed"],
+                tensordict["_extero_normed"],
             )
-            query = torch.stack([tensordict["_cmd_feature"], emb], dim=-2)
-            feature = self.fusion_encoder(query, tensordict["_obs_normed"], tensordict["_extero_normed"])
-            tensordict["_shared_feature"] = feature[..., 0, :]
-            tensordict["_future_feature"] = feature[..., 1, :]
+            tensordict["_shared_feature"] = feature[:, 0]
+            tensordict["_proprio_context"] = feature[:, 1]
+            tensordict["_extero_context"] = feature[:, 2]
         else:
-            query = tensordict["_cmd_feature"].unsqueeze(-2)
-            feature = self.fusion_encoder(query, tensordict["_obs_normed"], tensordict["_extero_normed"])
-            tensordict["_shared_feature"] = feature.squeeze(-2)
+            query = cmd # [N, 1, token_dim]
+            feature = EncoderTwo.forward_policy(
+                self.fusion_encoder,
+                query,
+                tensordict["_obs_normed"],
+                tensordict["_extero_normed"],
+            )
+            tensordict["_shared_feature"] = feature[:, 0]
         if actor:
             tensordict = self.actor(tensordict)
         if critic:
             tensordict = self.critic(tensordict)
-        if future_prediction:
-            pred, mu, logvar = self.future_predictor(
-                tensordict["_future_feature"],
-                tensordict["_future_target"]
-            )
-            tensordict["_future_pred"] = pred
-            tensordict["_future_mu"] = mu
-            tensordict["_future_logvar"] = logvar
         return tensordict
     
     def _configure_optimizers(self):
@@ -465,14 +336,18 @@ class PPOPolicy(TensorDictModuleBase):
         self.prev_tensordict = None
 
     def get_rollout_policy(self, mode: str="train", critic: bool=False):
-        if mode == "train":
-            policy = functools.partial(self.run_policy, actor=True, critic=critic)
-        elif mode == "eval" and self.cfg.stages[0] == "future":
+        if mode == "eval" and self.cfg.stages[0] == "future":
             def policy(tensordict: TensorDict):
                 self.run_policy(tensordict, actor=True, critic=False, future_prediction=True)
-                positions = tensordict["_future_pred"][..., :3]
+                pred, _ = self.future_predictor.sample_prior(
+                    tensordict["_proprio_context"],
+                    num_samples=3,
+                )
+                positions = pred[..., :3]
                 tensordict["future_traj"] = positions
                 return tensordict
+        else:
+            policy = functools.partial(self.run_policy, actor=True, critic=critic)
         if self.cfg.compile:
             policy = torch.compile(policy)
         return policy
@@ -524,17 +399,16 @@ class PPOPolicy(TensorDictModuleBase):
         total_weight = target.new_zeros(())
         total_sqerr = target.new_zeros(())
         total_kl_weighted = target.new_zeros(())
+        total_latent_ig = target.new_zeros(())
         for minibatch in make_batch(future_td, self.cfg.future_pred_minibatches):
             self.run_policy(minibatch, future_prediction=True)
             loss, meta = self.future_predictor.compute_loss(
-                minibatch["_future_feature"],
+                minibatch["_proprio_context"],
+                minibatch["_extero_context"],
                 minibatch["_future_target"],
-                minibatch["_future_valid"],
-                self.cfg.future_pred_coef,
                 self.cfg.future_kl_coef,
+                valid_mask=minibatch.get("_future_valid"),
             )
-            if meta.get("skip"):
-                continue
 
             self.opt_future.zero_grad(set_to_none=True)
             loss.backward()
@@ -544,13 +418,16 @@ class PPOPolicy(TensorDictModuleBase):
             total_weight += meta["recon_weight"]
             total_sqerr += meta["sqerr"]
             total_kl_weighted += meta["kl_loss"] * meta["kl_weight"]
+            total_latent_ig += meta["latent_ig"] * meta["recon_weight"]
 
         self.fusion_encoder.requires_grad_(True)
         pred_loss = total_sqerr / total_weight.clamp_min(1.0)
         kl_loss = total_kl_weighted / valid_mask.float().sum().clamp_min(1.0)
+        latent_ig = total_latent_ig / total_weight.clamp_min(1.0)
         return {
             "future/pred_loss": pred_loss.detach(),
             "future/kl_loss": kl_loss.detach(),
+            "future/latent_ig": latent_ig.detach(),
             "future/valid_ratio": valid_mask.float().mean().detach(),
         }
 
@@ -562,7 +439,8 @@ class PPOPolicy(TensorDictModuleBase):
             )
         
         infos = []
-        self._compute_advantage(tensordict, "adv", "ret")
+        with ScopedTimer("compute_advantage"):
+            self._compute_advantage(tensordict, "adv", "ret")
         action = tensordict[ACTION_KEY]
         adv_unnormalized = tensordict["adv"].clone()
         log_probs_before = tensordict["action_log_prob"]
@@ -577,7 +455,8 @@ class PPOPolicy(TensorDictModuleBase):
             batch = make_batch(tensordict, self.cfg.num_minibatches)
             for minibatch in batch:
                 minibatch = self._augment_symmetry(minibatch)
-                infos.append(self.update(minibatch))
+                with ScopedTimer("update_minibatch"):
+                    infos.append(self.update(minibatch))
         
         with torch.no_grad():
             tensordict_ = tensordict.copy()

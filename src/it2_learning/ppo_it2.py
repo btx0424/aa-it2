@@ -97,7 +97,7 @@ class PPOConfig:
     future_pred_coef: float = 0.0
     future_pred_minibatches: int = 4
     future_latent_dim: int = 16
-    future_kl_coef: float = 0.05
+    future_kl_coef: float = 0.02
     future_prior_kl_coef: float = 0.5
     stages: Tuple[str, ...] = ("policy", "future")
 
@@ -337,12 +337,16 @@ class PPOPolicy(TensorDictModuleBase):
         if mode == "eval" and self.cfg.stages[0] == "future":
             def policy(tensordict: TensorDict):
                 self.run_policy(tensordict, actor=True, critic=False, future_prediction=True)
-                pred, _ = self.future_predictor.sample_prior(
+                pred_0, _ = self.future_predictor.sample_prior(
                     tensordict["_proprio_context"],
                     num_samples=3,
                 )
-                positions = pred[..., :3]
-                tensordict["future_traj"] = positions
+                pred_1, _ = self.future_predictor.sample_prior(
+                    tensordict["_extero_context"],
+                    num_samples=3,
+                )
+                tensordict["proprio_pred"] = pred_0[..., :3]
+                tensordict["extero_pred"] = pred_1[..., :3]
                 return tensordict
         else:
             policy = functools.partial(self.run_policy, actor=True, critic=critic)

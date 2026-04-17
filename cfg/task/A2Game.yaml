@@ -25,9 +25,15 @@ input:
     action_scaling: {.*_joint: 0.4}
     max_delay: 1
     alpha_range: [0.8, 1.0]
-  future_traj:
+  proprio_pred:
     _target_: Marker
     body_frame: true
+    color: [0.0, 1.0, 0.0]
+  extero_pred:
+    _target_: Marker
+    body_frame: true
+    color: [1.0, 0.0, 0.0]
+  
 
 command:
   _target_: Game

@@ -97,7 +97,7 @@ class PPOConfig:
     future_pred_coef: float = 0.0
     future_pred_minibatches: int = 4
     future_latent_dim: int = 16
-    future_kl_coef: float = 0.01
+    future_kl_coef: float = 0.05
     stages: Tuple[str, ...] = ("policy", "future")
 
 
@@ -424,7 +424,9 @@ class PPOPolicy(TensorDictModuleBase):
         pred_loss = total_sqerr / total_weight.clamp_min(1.0)
         kl_loss = total_kl_weighted / valid_mask.float().sum().clamp_min(1.0)
         latent_ig = total_latent_ig / total_weight.clamp_min(1.0)
+        param_diff = check_parameters(self.future_predictor)
         return {
+            "future/param_diff": param_diff,
             "future/pred_loss": pred_loss.detach(),
             "future/kl_loss": kl_loss.detach(),
             "future/latent_ig": latent_ig.detach(),

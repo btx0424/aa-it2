@@ -1,3 +1,5 @@
+from collections import OrderedDict
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -70,9 +72,9 @@ class FuturePredictor(nn.Module):
                 nn.init.constant_(module.bias, 0.0)
     
     def wrap_DDP(self, device_ids: list[int]):
-        self.prior = DDP(self.prior, device_ids=device_ids)
-        self.posterior = DDP(self.posterior, device_ids=device_ids)
-        self.decoder = DDP(self.decoder, device_ids=device_ids)
+        self.ddp_prior = DDP(self.prior, device_ids=device_ids)
+        self.ddp_posterior = DDP(self.posterior, device_ids=device_ids)
+        self.ddp_decoder = DDP(self.decoder, device_ids=device_ids)
 
     def forward(
         self,

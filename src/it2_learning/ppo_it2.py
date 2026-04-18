@@ -318,14 +318,11 @@ class PPOPolicy(TensorDictModuleBase):
                 stacklevel=2,
             )
         self._amp_enabled = bool(self.cfg.use_amp) and self.device.type == "cuda"
-        if self._amp_enabled:
-            self._amp_dtype = (
-                torch.bfloat16
-                if torch.cuda.is_bf16_supported()
-                else torch.float16
-            )
-        else:
-            self._amp_dtype = torch.float32
+        self._amp_dtype = (
+            torch.bfloat16
+            if torch.cuda.is_bf16_supported()
+            else torch.float16
+        )
         self._scaler = torch.amp.GradScaler("cuda", enabled=self._amp_enabled)
 
     def on_stage_start(self, stage: str):

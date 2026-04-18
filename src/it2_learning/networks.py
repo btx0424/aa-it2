@@ -5,7 +5,6 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.nn.parallel import DistributedDataParallel as DDP
-
 # Prior/posterior heads emit ``(mu, rho)``; ``logvar = softplus(rho) + logvar_min`` so variance has a
 # positive floor and KL denominators stay bounded.
 _LOGVAR_MIN = math.log(1e-6)
@@ -102,11 +101,39 @@ class FuturePredictor(nn.Module):
         self.reset_parameters()
 
     def reset_parameters(self):
+        """Match PPO-style orthogonal inits; mild negative bias on ``rho`` for stable initial variance."""
+
+        def orth_linear(m: nn.Linear, gain: float) -> None:
+            nn.init.orthogonal_(m.weight, gain)
+            if m.bias is not None:
+                nn.init.zeros_(m.bias)
+
+        def reset_layernorms(seq: nn.Sequential) -> None:
+            for m in seq.modules():
+                if isinstance(m, nn.LayerNorm):
+                    m.reset_parameters()
+
+        def init_gaussian_mlp(seq: nn.Sequential) -> None:
+            linears = [m for m in seq if isinstance(m, nn.Linear)]
+            for lin in linears[:-1]:
+                orth_linear(lin, 0.1)
+            last = linears[-1]
+            orth_linear(last, 0.02)
+            if last.bias is not None:
+                last.bias.data[self.latent_dim :].fill_(-1.0)
+
         with torch.no_grad():
-            self.query_embedding.weight.data.normal_(0.0, 0.02)
-        for module in self.modules():
-            if isinstance(module, (nn.Linear, nn.LayerNorm)):
-                module.reset_parameters()
+            self.query_embedding.weight.normal_(0.0, 0.02)
+        init_gaussian_mlp(self.prior)
+        init_gaussian_mlp(self.posterior)
+        reset_layernorms(self.prior)
+        reset_layernorms(self.posterior)
+
+        dec_linears = [m for m in self.decoder if isinstance(m, nn.Linear)]
+        for lin in dec_linears[:-1]:
+            orth_linear(lin, 0.02)
+        orth_linear(dec_linears[-1], 0.01)
+        reset_layernorms(self.decoder)
 
     def wrap_DDP(self, device_ids: list[int]):
         self.query_embedding = DDP(self.query_embedding, device_ids=device_ids)

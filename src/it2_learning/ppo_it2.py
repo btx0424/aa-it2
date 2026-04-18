@@ -31,6 +31,7 @@ from contextlib import nullcontext
 
 from torchrl.data import Composite, TensorSpec
 from torchrl.modules import ProbabilisticActor
+from torchrl.objectives import hold_out_net
 from tensordict import TensorDict
 from tensordict.nn import (
     TensorDictModuleBase,
@@ -165,6 +166,7 @@ class PPOPolicy(TensorDictModuleBase):
             ["_cmd_normed"],
             ["_cmd_feature"],
         ).to(self.device)
+        self.distill_cmd_encoder = MLP([3, 256], first_non_muon=True).to(self.device)
 
         self.fusion_encoder: nn.Module = EncoderClass(
             proprio_shape,
@@ -208,6 +210,7 @@ class PPOPolicy(TensorDictModuleBase):
                 nn.init.constant_(module.actor_mean.bias, 0.)
         
         self.cmd_feature_encoder.apply(init_)
+        self.distill_cmd_encoder.apply(init_)
         self.fusion_encoder.apply(init_)
         self.actor.apply(init_)
         self.critic.apply(init_)
@@ -231,13 +234,12 @@ class PPOPolicy(TensorDictModuleBase):
         critic: bool=False,
         future_prediction: bool=False,
     ) -> TensorDict:
-        N = tensordict.shape[0]
         tensordict = self.vecnorm(tensordict)
         tensordict = self.cmd_feature_encoder(tensordict)
-        cmd = tensordict["_cmd_feature"].reshape(N, 1, -1)
+        cmd = tensordict["_cmd_feature"].reshape(*tensordict.shape, 1, 256)
         if future_prediction:
             future_query = self.future_predictor.query_embedding(torch.arange(2, device=self.device))
-            future_query = future_query.expand(N, 2, -1)
+            future_query = future_query.expand(*tensordict.shape, 2, 256)
             query = torch.cat([cmd, future_query], dim=-2) # [N, 3, token_dim]
             feature = EncoderTwo.forward_policy_future(
                 self.fusion_encoder,
@@ -245,18 +247,18 @@ class PPOPolicy(TensorDictModuleBase):
                 tensordict["_obs_normed"],
                 tensordict["_extero_normed"],
             )
-            tensordict["_shared_feature"] = feature[:, 0]
-            tensordict["_proprio_context"] = feature[:, 1]
-            tensordict["_extero_context"] = feature[:, 2]
+            tensordict["_shared_feature"] = feature[..., 0, :]
+            tensordict["_proprio_context"] = feature[..., 1, :]
+            tensordict["_extero_context"] = feature[..., 2, :]
         else:
-            query = cmd # [N, 1, token_dim]
+            query = cmd # [..., 1, token_dim]
             feature = EncoderTwo.forward_policy(
                 self.fusion_encoder,
                 query,
                 tensordict["_obs_normed"],
                 tensordict["_extero_normed"],
             )
-            tensordict["_shared_feature"] = feature[:, 0]
+            tensordict["_shared_feature"] = feature[..., 0, :]
         if actor:
             tensordict = self.actor(tensordict)
         if critic:
@@ -310,7 +312,14 @@ class PPOPolicy(TensorDictModuleBase):
             lr=1e-4,
             weight_decay=0.01,
         )
-
+        self.opt_distill = torch.optim.AdamW(
+            [
+                {"params": self.distill_cmd_encoder.parameters()},
+            ],
+            lr=3e-4,
+            weight_decay=0.01,
+        )
+        # Setup mixed precision training
         if self.cfg.use_amp and self.device.type != "cuda":
             warnings.warn(
                 "PPOConfig.use_amp=True requires a CUDA device; mixed precision disabled.",
@@ -457,6 +466,39 @@ class PPOPolicy(TensorDictModuleBase):
             "future/H[q(z|o_ext,y)]": entropy_posterior.detach().item(),
             "future/valid_ratio": valid_mask.float().mean().detach().item(),
         }
+    
+    def train_distillation(self, tensordict: TensorDict):
+        """Relabel trajectory as following a locomotion command"""
+        with (
+            hold_out_net(self.cmd_feature_encoder),
+            hold_out_net(self.fusion_encoder),
+        ):
+            root_state_w = tensordict["next", "root_state_w"]
+            root_quat_w = root_state_w[..., 3:7]
+            root_lin_vel_w = root_state_w[..., 7:10]
+            root_ang_vel_w = root_state_w[..., 10:13]
+            root_lin_vel_b = quat_rotate_inverse(root_quat_w, root_lin_vel_w)
+            root_ang_vel_b = quat_rotate_inverse(root_quat_w, root_ang_vel_w)
+            command = torch.cat([
+                root_lin_vel_b[..., :2],
+                root_ang_vel_b[..., 2:3]
+            ], dim=-1)
+            tensordict["_command"] = command
+
+            infos = []
+            for minibatch in make_batch(tensordict, 4):
+                feature_target = self.cmd_feature_encoder(minibatch)
+                feature_pred = self.distill_cmd_encoder(minibatch["_command"])
+                loss = F.mse_loss(feature_pred, feature_target)
+                self.opt_distill.zero_grad(set_to_none=True)
+                loss.backward()
+                self.opt_distill.step()
+
+                infos.append({
+                    "distillation/loss": loss.detach().item(),
+                })
+            infos = pytree.tree_map(lambda *xs: sum(xs).item() / len(xs), *infos)
+        return infos
 
     def train_policy(self, tensordict: TensorDict):
         if hasattr(self, "prev_cfg") and self.prev_cfg.muon != self.cfg.muon:

@@ -1,9 +1,20 @@
 from collections import OrderedDict
+import math
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.nn.parallel import DistributedDataParallel as DDP
+
+# Prior/posterior heads emit ``(mu, rho)``; ``logvar = softplus(rho) + logvar_min`` so variance has a
+# positive floor and KL denominators stay bounded.
+_LOGVAR_MIN = math.log(1e-6)
+
+
+def gaussian_moments_from_head(out: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    mu, rho = out.chunk(2, dim=-1)
+    logvar = F.softplus(rho) + _LOGVAR_MIN
+    return mu, logvar
 
 
 def kl_gaussian(
@@ -15,7 +26,7 @@ def kl_gaussian(
     """
     Compute the KL divergence between two Gaussian distributions.
 
-    Sum over the last dimension.
+    Sum over the last (event) dimension.
     """
     return 0.5 * (
         logvar_p
@@ -23,6 +34,20 @@ def kl_gaussian(
         + (torch.exp(logvar_q) + (mu_q - mu_p) ** 2) / torch.exp(logvar_p)
         - 1
     ).sum(dim=-1)
+
+
+def entropy_gaussian(
+    mu: torch.Tensor,
+    logvar: torch.Tensor,
+) -> torch.Tensor:
+    """
+    Compute the entropy of a Gaussian distribution.
+
+    Sum over the last (event) dimension.
+    """
+    # H = 0.5 * sum_i (1 + log(2*pi) + logvar_i) for diagonal N(mu, diag(exp(logvar))).
+    two_pi = mu.new_tensor(2.0 * torch.pi)
+    return 0.5 * (1.0 + logvar + two_pi.log()).sum(dim=-1)
 
 
 def maybe_unwrap(module: nn.Module):
@@ -80,9 +105,8 @@ class FuturePredictor(nn.Module):
         with torch.no_grad():
             self.query_embedding.weight.data.normal_(0.0, 0.02)
         for module in self.modules():
-            if isinstance(module, nn.Linear):
-                nn.init.orthogonal_(module.weight, 0.02)
-                nn.init.constant_(module.bias, 0.0)
+            if isinstance(module, (nn.Linear, nn.LayerNorm)):
+                module.reset_parameters()
 
     def wrap_DDP(self, device_ids: list[int]):
         self.query_embedding = DDP(self.query_embedding, device_ids=device_ids)
@@ -114,10 +138,11 @@ class FuturePredictor(nn.Module):
         target: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Inference: sample ``z`` from ``p(z|context)`` and decode. Returns ``(pred, z)``."""
-        mu, logvar = self.prior(context).chunk(2, dim=-1)
+        mu, logvar = gaussian_moments_from_head(self.prior(context))
+        entropy = entropy_gaussian(mu.detach(), logvar.detach())
         z = mu + torch.randn_like(mu) * torch.exp(logvar * 0.5)
         pred = self.decoder(torch.cat([context, z], dim=-1))
-        return pred, z
+        return pred, z, entropy
 
     def sample_prior(
         self,
@@ -132,12 +157,13 @@ class FuturePredictor(nn.Module):
         ``z`` is ``(..., latent_dim)``. Otherwise a sample axis is inserted before the last
         dimension: ``(..., num_samples, pred_dim)`` and ``(..., num_samples, latent_dim)``.
         """
-        mu, logvar = self.prior(context).chunk(2, dim=-1)
+        mu, logvar = gaussian_moments_from_head(self.prior(context))
+        entropy = entropy_gaussian(mu.detach(), logvar.detach())
         std = torch.exp(0.5 * logvar)
         if num_samples == 1:
             z = mu + torch.randn_like(mu) * std
             pred = self.decoder(torch.cat([context, z], dim=-1))
-            return pred, z
+            return pred, z, entropy
         eps = torch.randn(
             *mu.shape[:-1],
             num_samples,
@@ -150,7 +176,7 @@ class FuturePredictor(nn.Module):
             *context.shape[:-1], num_samples, context.shape[-1]
         )
         pred = self.decoder(torch.cat([ctx, z], dim=-1))
-        return pred, z
+        return pred, z, entropy
 
     def compute_loss(
         self,
@@ -167,12 +193,23 @@ class FuturePredictor(nn.Module):
         - ``kl_prior`` is ``KL(p(z|o_ext) ‖ p(z|o_pro))`` with extero moments detached so gradients align ``p(z|o_pro)`` toward ``p(z|o_ext)``.
 
         ``meta["latent_ig"]`` is the minibatch mean of ``kl_prior`` (prior-shift / IG-flavored term).
+
+        Entropy meta keys are minibatch means of ``H[p(z|o_pro)]``, ``H[p(z|o_ext)]``, and ``H[q(z|o_ext,y)]``
+        (masked mean when ``valid_mask`` is set).
         """
-        proprio_mu, proprio_logvar = self.prior(proprio_context).chunk(2, dim=-1)
-        extero_mu, extero_logvar = self.prior(extero_context).chunk(2, dim=-1)
+        proprio_mu, proprio_logvar = gaussian_moments_from_head(
+            self.prior(proprio_context)
+        )
+        extero_mu, extero_logvar = gaussian_moments_from_head(self.prior(extero_context))
 
         posterior_in = torch.cat([extero_context, target], dim=-1)
-        posterior_mu, posterior_logvar = self.posterior(posterior_in).chunk(2, dim=-1)
+        posterior_mu, posterior_logvar = gaussian_moments_from_head(
+            self.posterior(posterior_in)
+        )
+
+        entropy_prior_proprio = entropy_gaussian(proprio_mu.detach(), proprio_logvar.detach())
+        entropy_prior_extero = entropy_gaussian(extero_mu.detach(), extero_logvar.detach())
+        entropy_posterior = entropy_gaussian(posterior_mu.detach(), posterior_logvar.detach())
 
         kl_posterior = kl_gaussian(
             posterior_mu,
@@ -191,7 +228,10 @@ class FuturePredictor(nn.Module):
             posterior_logvar * 0.5
         )
         pred = self.decoder(torch.cat([extero_context, z], dim=-1))
-        likelihood = F.mse_loss(pred, target, reduction="none").sum(dim=-1)
+        # yaw is ``target[..., 3:4]`` (relative pos, yaw, linvel); scale its squared error by ``1/pi``.
+        sq_err = (pred - target) ** 2
+        sq_err[..., 3:4] = sq_err[..., 3:4] / torch.pi
+        likelihood = sq_err.sum(dim=-1)
 
         per_term = likelihood + kl_coef * kl_posterior + prior_kl_coef * kl_prior
 
@@ -207,6 +247,9 @@ class FuturePredictor(nn.Module):
             kl_sum = (kl_posterior * maskf).sum()
             kl_prior_sum = (kl_prior * maskf).sum()
             latent_ig_mean = kl_prior_sum / denom
+            entropy_prior_proprio_mean = (entropy_prior_proprio * maskf).sum() / denom
+            entropy_prior_extero_mean = (entropy_prior_extero * maskf).sum() / denom
+            entropy_posterior_mean = (entropy_posterior * maskf).sum() / denom
         else:
             loss = per_term.mean()
             n = float(likelihood.numel())
@@ -215,6 +258,9 @@ class FuturePredictor(nn.Module):
             kl_sum = kl_posterior.sum()
             kl_prior_sum = kl_prior.sum()
             latent_ig_mean = kl_prior.mean()
+            entropy_prior_proprio_mean = entropy_prior_proprio.mean()
+            entropy_prior_extero_mean = entropy_prior_extero.mean()
+            entropy_posterior_mean = entropy_posterior.mean()
 
         w = kl_posterior.new_tensor(1.0)
         meta = {
@@ -224,5 +270,8 @@ class FuturePredictor(nn.Module):
             "kl_prior_loss": kl_prior_sum,
             "kl_weight": w,
             "latent_ig": latent_ig_mean.detach(),
+            "entropy_prior_proprio": entropy_prior_proprio_mean.detach(),
+            "entropy_prior_extero": entropy_prior_extero_mean.detach(),
+            "entropy_posterior": entropy_posterior_mean.detach(),
         }
         return loss, meta

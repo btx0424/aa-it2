@@ -302,12 +302,12 @@ class PPOPolicy(TensorDictModuleBase):
                 lr=self.cfg.lr,
                 weight_decay=0.01
             )
-        # Future prediction always uses its own AdamW optimizer.
+        # Future prediction uses a separate, smaller LR (VAE-style head; main cfg.lr is for PPO).
         self.opt_future = torch.optim.AdamW(
             [
                 {"params": self.future_predictor.parameters()},
             ],
-            lr=self.cfg.lr,
+            lr=1e-4,
             weight_decay=0.01,
         )
 
@@ -337,14 +337,15 @@ class PPOPolicy(TensorDictModuleBase):
         if mode == "eval" and self.cfg.stages[0] == "future":
             def policy(tensordict: TensorDict):
                 self.run_policy(tensordict, actor=True, critic=False, future_prediction=True)
-                pred_0, _ = self.future_predictor.sample_prior(
+                pred_0, _, entropy_0 = self.future_predictor.sample_prior(
                     tensordict["_proprio_context"],
                     num_samples=3,
                 )
-                pred_1, _ = self.future_predictor.sample_prior(
+                pred_1, _, entropy_1 = self.future_predictor.sample_prior(
                     tensordict["_extero_context"],
                     num_samples=3,
                 )
+                # print(entropy_0[0], entropy_1[0])
                 tensordict["proprio_pred"] = pred_0[..., :3]
                 tensordict["extero_pred"] = pred_1[..., :3]
                 return tensordict
@@ -403,6 +404,9 @@ class PPOPolicy(TensorDictModuleBase):
         total_kl_weighted = target.new_zeros(())
         total_kl_prior_weighted = target.new_zeros(())
         total_latent_ig = target.new_zeros(())
+        total_entropy_prior_proprio = target.new_zeros(())
+        total_entropy_prior_extero = target.new_zeros(())
+        total_entropy_posterior = target.new_zeros(())
         for minibatch in make_batch(future_td, self.cfg.future_pred_minibatches):
             self.run_policy(minibatch, future_prediction=True)
             loss, meta = self.future_predictor.compute_loss(
@@ -413,30 +417,47 @@ class PPOPolicy(TensorDictModuleBase):
                 prior_kl_coef=self.cfg.future_prior_kl_coef,
                 valid_mask=minibatch.get("_future_valid"),
             )
-
             self.opt_future.zero_grad(set_to_none=True)
             loss.backward()
             if aa.is_distributed() and not self.cfg.use_ddp:
                 allreduce_grads(self.future_predictor.parameters())
+            
+            grad_norm = nn.utils.clip_grad_norm_(self.future_predictor.parameters(), self.max_grad_norm)
             self.opt_future.step()
+
             total_weight += meta["recon_weight"]
             total_sqerr += meta["sqerr"]
             total_kl_weighted += meta["kl_loss"] * meta["kl_weight"]
             total_kl_prior_weighted += meta["kl_prior_loss"] * meta["kl_weight"]
             total_latent_ig += meta["latent_ig"] * meta["recon_weight"]
+            total_entropy_prior_proprio += (
+                meta["entropy_prior_proprio"] * meta["recon_weight"]
+            )
+            total_entropy_prior_extero += (
+                meta["entropy_prior_extero"] * meta["recon_weight"]
+            )
+            total_entropy_posterior += meta["entropy_posterior"] * meta["recon_weight"]
 
         self.fusion_encoder.requires_grad_(True)
         pred_loss = total_sqerr / total_weight.clamp_min(1.0)
         kl_loss = total_kl_weighted / valid_mask.float().sum().clamp_min(1.0)
         kl_prior_loss = total_kl_prior_weighted / valid_mask.float().sum().clamp_min(1.0)
         latent_ig = total_latent_ig / total_weight.clamp_min(1.0)
+        tw = total_weight.clamp_min(1.0)
+        entropy_prior_proprio = total_entropy_prior_proprio / tw
+        entropy_prior_extero = total_entropy_prior_extero / tw
+        entropy_posterior = total_entropy_posterior / tw
         param_diff = check_parameters(self.future_predictor)
         return {
+            "future/grad_norm": grad_norm.item(),
             "future/param_diff": param_diff,
             "future/pred_loss": pred_loss.detach().item(),
             "future/KL(q(z|o_ext,y)||p(z|o_ext))": kl_loss.detach().item(),
             "future/KL(p(z|o_ext)||p(z|o_pro))": kl_prior_loss.detach().item(),
             "future/latent_ig": latent_ig.detach().item(),
+            "future/H[p(z|o_pro)]": entropy_prior_proprio.detach().item(),
+            "future/H[p(z|o_ext)]": entropy_prior_extero.detach().item(),
+            "future/H[q(z|o_ext,y)]": entropy_posterior.detach().item(),
             "future/valid_ratio": valid_mask.float().mean().detach().item(),
         }
 

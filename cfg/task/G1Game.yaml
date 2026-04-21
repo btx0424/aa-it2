@@ -109,7 +109,12 @@ termination:
     - ".*shoulder_.*_link"
     - ".*(wrist|elbow).*"
   fall_over: {xy_thres: 0.9}
-  bodies_too_close: {body_names: ".*knee_link", threshold: 0.06}
+  # bodies_too_close: {body_names: ".*knee_link", threshold: 0.06}
+  segments_cross: {
+    segment1_names: [left_knee_link, left_ankle_pitch_link],
+    segment2_names: [right_knee_link, right_ankle_pitch_link],
+    threshold: 0.05
+  }
   game.caught_termination: {}
   game.both_terminate: {}
 

@@ -85,7 +85,7 @@ class PPOConfig:
     clip_param: float = 0.2
     entropy_coef: float = 0.002
 
-    encoder_type: str = "one"
+    encoder_type: str = "two"
     muon: bool = False
     compile: bool = False
     use_ddp: bool = True
@@ -94,6 +94,10 @@ class PPOConfig:
     in_keys: Tuple[str, ...] = (CMD_KEY, OBS_KEY, "extero", "root_state_w")
     cnn_norm: str = "none"
     cnn_norm_groups: int = 8
+    # Extero: "cnn" = small built-in conv stack; "defm_cnn" = DeFM ResNet/RegNet + BiFPN backbone.
+    extero_encoder: str = "cnn" # or "defm_cnn"
+    defm_variant: str = "defm_resnet18"  # or "defm_regnet_y_400mf"
+    defm_pretrained: bool = True
     future_pred_dim: int = 7
     future_pred_coef: float = 0.0
     future_pred_minibatches: int = 4
@@ -175,6 +179,9 @@ class PPOPolicy(TensorDictModuleBase):
             cnn_norm=self.cfg.cnn_norm,
             cnn_norm_groups=self.cfg.cnn_norm_groups,
             hidden_dim=256,
+            extero_encoder=self.cfg.extero_encoder,
+            defm_variant=self.cfg.defm_variant,
+            defm_pretrained=self.cfg.defm_pretrained,
         ).to(self.device)
 
         self.future_predictor = FuturePredictor(
@@ -199,6 +206,8 @@ class PPOPolicy(TensorDictModuleBase):
         self.run_policy(fake_input, True, True)
         
         def init_(module):
+            if getattr(module, "_defm_no_reinit", False):
+                return
             if isinstance(module, nn.Linear):
                 nn.init.orthogonal_(module.weight, 0.02)
                 nn.init.constant_(module.bias, 0.)
@@ -268,7 +277,11 @@ class PPOPolicy(TensorDictModuleBase):
     def _configure_distributed(self):
         if self.cfg.use_ddp:
             local_rank = aa.get_local_rank()
-            self.fusion_encoder = DDP(self.fusion_encoder, device_ids=[local_rank])
+            self.fusion_encoder = DDP(
+                self.fusion_encoder,
+                device_ids=[local_rank],
+                find_unused_parameters=True,
+            )
             self.cmd_feature_encoder = DDP(self.cmd_feature_encoder, device_ids=[local_rank])
             self.future_predictor.wrap_DDP(device_ids=[local_rank])
             self.actor = DDP(self.actor, device_ids=[local_rank])

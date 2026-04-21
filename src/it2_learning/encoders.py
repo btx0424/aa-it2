@@ -7,6 +7,9 @@ from jaxtyping import Float
 
 from torch.nn.attention import SDPBackend, sdpa_kernel
 
+ExteroEncoderKind = Literal["cnn", "defm_cnn"]
+DefmCnnVariant = Literal["defm_resnet18", "defm_regnet_y_400mf"]
+
 
 def _make_cnn_norm(
     channels: int,
@@ -22,6 +25,113 @@ def _make_cnn_norm(
     while channels % group_count != 0 and group_count > 1:
         group_count -= 1
     return nn.GroupNorm(group_count, channels)
+
+
+def simple_extero_encoder(
+    extero_channels: int,
+    token_dim: int,
+    activation: Type[nn.Module],
+    cnn_norm: Literal["none", "group"],
+    cnn_norm_groups: int,
+) -> nn.Sequential:
+    return nn.Sequential(
+        nn.Conv2d(extero_channels, 32, kernel_size=3, stride=2, padding=1),
+        _make_cnn_norm(32, cnn_norm, cnn_norm_groups),
+        activation(),
+        nn.Conv2d(32, 64, kernel_size=3, stride=2, padding=1),
+        _make_cnn_norm(64, cnn_norm, cnn_norm_groups),
+        activation(),
+        nn.Conv2d(64, token_dim, kernel_size=3, stride=2, padding=1),
+        _make_cnn_norm(token_dim, cnn_norm, cnn_norm_groups),
+        activation(),
+        nn.AdaptiveAvgPool2d(1),
+        nn.Flatten(start_dim=1),
+    )
+
+
+class ExteroDefmCnn(nn.Module):
+    """DeFM convolutional backbone (ResNet/RegNet + BiFPN) → linear projection to ``token_dim``.
+
+    Expects ``extero_inp`` shaped ``(..., C, H, W)`` with **channel 0** as a metric depth map
+    (meters). Uses :func:`defm.utils.preprocess_depth_batch` (vectorized torch, same logic as
+    ``preprocess_depth_image``). Extra channels are ignored (only the first depth channel is used).
+    """
+
+    VARIANTS: tuple[str, ...] = ("defm_resnet18", "defm_regnet_y_400mf")
+
+    def __init__(
+        self,
+        variant: DefmCnnVariant,
+        token_dim: int,
+        pretrained: bool = True,
+    ):
+        super().__init__()
+        if variant not in self.VARIANTS:
+            raise ValueError(
+                f"defm_cnn variant {variant!r} must be one of {self.VARIANTS}"
+            )
+        
+        from defm.model_factory import create_defm_model
+        self.variant = variant
+        self.backbone = create_defm_model(variant, pretrained=pretrained)
+        self.backbone.requires_grad_(False)
+
+        for m in self.backbone.modules():
+            m._defm_no_reinit = True  # skip PPOPolicy.init_ orthogonal reset on pretrained backbone
+        
+        device = next(self.backbone.parameters()).device
+        with torch.no_grad():
+            out = self.backbone(torch.zeros(1, 3, 224, 224, device=device))
+        in_dim = out["global_backbone"].shape[-1]
+        self.proj = nn.Linear(in_dim, token_dim)
+        self.proj.weight._non_muon = True
+
+    @torch.no_grad()
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        from defm.utils import preprocess_depth_batch
+
+        if x.ndim != 4:
+            raise ValueError(f"ExteroDefmCnn expects (N, C, H, W), got {tuple(x.shape)}")
+        _, _, h, w = x.shape
+        # Batched DeFM depth → (N, 3, H', W') on `x.device` (no per-sample numpy loop).
+        x3 = preprocess_depth_batch(
+            x,
+            target_size=(h, w),
+            patch_size=32,
+            device=x.device,
+        )
+        feat = self.backbone(x3)["global_backbone"]
+        return self.proj(feat)
+
+
+def build_extero_encoder(
+    *,
+    extero_channels: int,
+    extero_encoder: ExteroEncoderKind,
+    defm_variant: DefmCnnVariant,
+    defm_pretrained: bool,
+    token_dim: int,
+    activation: Type[nn.Module],
+    cnn_norm: Literal["none", "group"],
+    cnn_norm_groups: int,
+) -> nn.Module:
+    if extero_encoder == "cnn":
+        return simple_extero_encoder(
+            extero_channels,
+            token_dim,
+            activation,
+            cnn_norm,
+            cnn_norm_groups,
+        )
+    if extero_encoder == "defm_cnn":
+        return ExteroDefmCnn(
+            variant=defm_variant,
+            token_dim=token_dim,
+            pretrained=defm_pretrained,
+        )
+    raise ValueError(
+        f"extero_encoder must be 'cnn' or 'defm_cnn', got {extero_encoder!r}"
+    )
 
 
 class EncoderOne(nn.Module):
@@ -42,6 +152,9 @@ class EncoderOne(nn.Module):
         activation: Type[nn.Module] = nn.SiLU,
         cnn_norm: Literal["none", "group"] = "none",
         cnn_norm_groups: int = 8,
+        extero_encoder: ExteroEncoderKind = "cnn",
+        defm_variant: DefmCnnVariant = "defm_resnet18",
+        defm_pretrained: bool = True,
     ):
         super().__init__()
         self.token_dim = token_dim
@@ -49,18 +162,15 @@ class EncoderOne(nn.Module):
         extero_channels = extero_shape[0] if len(extero_shape) == 3 else 1
 
         self.proprio_mlp = MLP([proprio_shape[-1], 256, token_dim], activation=activation, first_non_muon=True)
-        self.extero_mlp = nn.Sequential(
-            nn.Conv2d(extero_channels, 32, kernel_size=3, stride=2, padding=1),
-            _make_cnn_norm(32, cnn_norm, cnn_norm_groups),
-            activation(),
-            nn.Conv2d(32, 64, kernel_size=3, stride=2, padding=1),
-            _make_cnn_norm(64, cnn_norm, cnn_norm_groups),
-            activation(),
-            nn.Conv2d(64, token_dim, kernel_size=3, stride=2, padding=1),
-            _make_cnn_norm(token_dim, cnn_norm, cnn_norm_groups),
-            activation(),
-            nn.AdaptiveAvgPool2d(1),
-            nn.Flatten(start_dim=1),
+        self.extero_mlp = build_extero_encoder(
+            extero_channels=extero_channels,
+            extero_encoder=extero_encoder,
+            defm_variant=defm_variant,
+            defm_pretrained=defm_pretrained,
+            token_dim=token_dim,
+            activation=activation,
+            cnn_norm=cnn_norm,
+            cnn_norm_groups=cnn_norm_groups,
         )
         self.modality_embedding = nn.Parameter(torch.randn(3, token_dim) * 0.02)
         self.modality_embedding._non_muon = True
@@ -144,6 +254,9 @@ class EncoderTwo(nn.Module):
         activation: Type[nn.Module] = nn.SiLU,
         cnn_norm: Literal["none", "group"] = "none",
         cnn_norm_groups: int = 8,
+        extero_encoder: ExteroEncoderKind = "cnn",
+        defm_variant: DefmCnnVariant = "defm_resnet18",
+        defm_pretrained: bool = True,
     ):
         super().__init__()
         self.token_dim = token_dim
@@ -151,18 +264,15 @@ class EncoderTwo(nn.Module):
         extero_channels = extero_shape[0] if len(extero_shape) == 3 else 1
 
         self.proprio_mlp = MLP([proprio_shape[-1], 256, token_dim], activation=activation, first_non_muon=True)
-        self.extero_mlp = nn.Sequential(
-            nn.Conv2d(extero_channels, 32, kernel_size=3, stride=2, padding=1),
-            _make_cnn_norm(32, cnn_norm, cnn_norm_groups),
-            activation(),
-            nn.Conv2d(32, 64, kernel_size=3, stride=2, padding=1),
-            _make_cnn_norm(64, cnn_norm, cnn_norm_groups),
-            activation(),
-            nn.Conv2d(64, token_dim, kernel_size=3, stride=2, padding=1),
-            _make_cnn_norm(token_dim, cnn_norm, cnn_norm_groups),
-            activation(),
-            nn.AdaptiveAvgPool2d(1),
-            nn.Flatten(start_dim=1),
+        self.extero_mlp = build_extero_encoder(
+            extero_channels=extero_channels,
+            extero_encoder=extero_encoder,
+            defm_variant=defm_variant,
+            defm_pretrained=defm_pretrained,
+            token_dim=token_dim,
+            activation=activation,
+            cnn_norm=cnn_norm,
+            cnn_norm_groups=cnn_norm_groups,
         )
 
         self.self_attn = nn.MultiheadAttention(

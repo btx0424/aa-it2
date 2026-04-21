@@ -405,14 +405,7 @@ class PPOPolicy(TensorDictModuleBase):
         future_td["_future_target"] = target
         future_td["_future_valid"] = valid_mask
 
-        total_weight = target.new_zeros(())
-        total_sqerr = target.new_zeros(())
-        total_kl_weighted = target.new_zeros(())
-        total_kl_prior_weighted = target.new_zeros(())
-        total_latent_ig = target.new_zeros(())
-        total_entropy_prior_proprio = target.new_zeros(())
-        total_entropy_prior_extero = target.new_zeros(())
-        total_entropy_posterior = target.new_zeros(())
+        infos = []
         for minibatch in make_batch(future_td, self.cfg.future_pred_minibatches):
             self.run_policy(minibatch, future_prediction=True)
             loss, meta = self.future_predictor.compute_loss(
@@ -427,45 +420,17 @@ class PPOPolicy(TensorDictModuleBase):
             loss.backward()
             if aa.is_distributed() and not self.cfg.use_ddp:
                 allreduce_grads(self.future_predictor.parameters())
-            
+
             grad_norm = nn.utils.clip_grad_norm_(self.future_predictor.parameters(), self.max_grad_norm)
             self.opt_future.step()
 
-            total_weight += meta["recon_weight"]
-            total_sqerr += meta["sqerr"]
-            total_kl_weighted += meta["kl_loss"] * meta["kl_weight"]
-            total_kl_prior_weighted += meta["kl_prior_loss"] * meta["kl_weight"]
-            total_latent_ig += meta["latent_ig"] * meta["recon_weight"]
-            total_entropy_prior_proprio += (
-                meta["entropy_prior_proprio"] * meta["recon_weight"]
-            )
-            total_entropy_prior_extero += (
-                meta["entropy_prior_extero"] * meta["recon_weight"]
-            )
-            total_entropy_posterior += meta["entropy_posterior"] * meta["recon_weight"]
+            infos.append({"future/grad_norm": grad_norm, **meta})
 
         self.fusion_encoder.requires_grad_(True)
-        pred_loss = total_sqerr / total_weight.clamp_min(1.0)
-        kl_loss = total_kl_weighted / valid_mask.float().sum().clamp_min(1.0)
-        kl_prior_loss = total_kl_prior_weighted / valid_mask.float().sum().clamp_min(1.0)
-        latent_ig = total_latent_ig / total_weight.clamp_min(1.0)
-        tw = total_weight.clamp_min(1.0)
-        entropy_prior_proprio = total_entropy_prior_proprio / tw
-        entropy_prior_extero = total_entropy_prior_extero / tw
-        entropy_posterior = total_entropy_posterior / tw
-        param_diff = check_parameters(self.future_predictor)
-        return {
-            "future/grad_norm": grad_norm.item(),
-            "future/param_diff": param_diff,
-            "future/pred_loss": pred_loss.detach().item(),
-            "future/KL(q(z|o_ext,y)||p(z|o_ext))": kl_loss.detach().item(),
-            "future/KL(p(z|o_ext)||p(z|o_pro))": kl_prior_loss.detach().item(),
-            "future/latent_ig": latent_ig.detach().item(),
-            "future/H[p(z|o_pro)]": entropy_prior_proprio.detach().item(),
-            "future/H[p(z|o_ext)]": entropy_prior_extero.detach().item(),
-            "future/H[q(z|o_ext,y)]": entropy_posterior.detach().item(),
-            "future/valid_ratio": valid_mask.float().mean().detach().item(),
-        }
+        infos = pytree.tree_map(lambda *xs: sum(xs).item() / len(xs), *infos)
+        infos["future/param_diff"] = check_parameters(self.future_predictor)
+        infos["future/valid_ratio"] = valid_mask.float().mean().detach().item()
+        return infos
     
     def train_distillation(self, tensordict: TensorDict):
         """Relabel trajectory as following a locomotion command"""

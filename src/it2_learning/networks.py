@@ -219,10 +219,10 @@ class FuturePredictor(nn.Module):
         - ``kl_posterior`` is ``KL(q(z|o_ext,y) ‖ p(z|o_ext))`` with ``o``.
         - ``kl_prior`` is ``KL(p(z|o_ext) ‖ p(z|o_pro))`` with extero moments detached so gradients align ``p(z|o_pro)`` toward ``p(z|o_ext)``.
 
-        ``meta["latent_ig"]`` is the minibatch mean of ``kl_prior`` (prior-shift / IG-flavored term).
-
-        Entropy meta keys are minibatch means of ``H[p(z|o_pro)]``, ``H[p(z|o_ext)]``, and ``H[q(z|o_ext,y)]``
-        (masked mean when ``valid_mask`` is set).
+        Return dict keys match PPO logging names, e.g. ``"future/latent_ig"`` is the minibatch mean of
+        ``kl_prior`` (prior-shift / IG-flavored term). KL and pred entries are masked sums divided by
+        valid count (same as mean per valid element). Entropy entries are masked means when
+        ``valid_mask`` is set.
         """
         proprio_mu, proprio_logvar = gaussian_moments_from_head(
             self.prior(proprio_context)
@@ -289,16 +289,14 @@ class FuturePredictor(nn.Module):
             entropy_prior_extero_mean = entropy_prior_extero.mean()
             entropy_posterior_mean = entropy_posterior.mean()
 
-        w = kl_posterior.new_tensor(1.0)
-        meta = {
-            "recon_weight": recon_weight,
-            "sqerr": sqerr,
-            "kl_loss": kl_sum,
-            "kl_prior_loss": kl_prior_sum,
-            "kl_weight": w,
-            "latent_ig": latent_ig_mean.detach(),
-            "entropy_prior_proprio": entropy_prior_proprio_mean.detach(),
-            "entropy_prior_extero": entropy_prior_extero_mean.detach(),
-            "entropy_posterior": entropy_posterior_mean.detach(),
+        rw = recon_weight.clamp_min(1.0)
+        info = {
+            "future/pred_loss": sqerr / rw,
+            "future/KL(q(z|o_ext,y)||p(z|o_ext))": kl_sum / rw,
+            "future/KL(p(z|o_ext)||p(z|o_pro))": kl_prior_sum / rw,
+            "future/latent_ig": latent_ig_mean.detach(),
+            "future/H[p(z|o_pro)]": entropy_prior_proprio_mean.detach(),
+            "future/H[p(z|o_ext)]": entropy_prior_extero_mean.detach(),
+            "future/H[q(z|o_ext,y)]": entropy_posterior_mean.detach(),
         }
-        return loss, meta
+        return loss, info

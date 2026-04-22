@@ -43,7 +43,6 @@ observation:
   command:
     command:  {}
   policy:
-    command:  {}
     gravity_multistep: {steps: 4, noise_std: 0.05}
     joint_pos_multistep: {steps: 4, noise_std: 0.05}
     joint_vel_multistep: {steps: 4, noise_std: 0.2}

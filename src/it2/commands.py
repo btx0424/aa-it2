@@ -189,8 +189,8 @@ class chase_distance_change(Reward[Game]):
 class chase_velocity(Reward[Game]):
     namespace = "game"
 
-    def __init__(self, env, weight: float, enabled: bool = True):
-        super().__init__(env, weight, enabled)
+    def __init__(self, env, weight: float):
+        super().__init__(env, weight)
         self.asset = self.command_manager.asset
 
     def _compute(self) -> tuple[torch.Tensor, torch.Tensor]:
@@ -205,8 +205,8 @@ class chase_velocity(Reward[Game]):
 class evade_velocity(Reward[Game]):
     namespace = "game"
 
-    def __init__(self, env, weight: float, enabled: bool = True):
-        super().__init__(env, weight, enabled)
+    def __init__(self, env, weight: float):
+        super().__init__(env, weight)
         self.asset = self.command_manager.asset
 
     def _compute(self) -> tuple[torch.Tensor, torch.Tensor]:
@@ -231,8 +231,8 @@ class evade_distance_change(Reward[Game]):
 class evade_distance(Reward[Game]):
     namespace = "game"
 
-    def __init__(self, env, weight: float, enabled: bool = True):
-        super().__init__(env, weight, enabled)
+    def __init__(self, env, weight: float):
+        super().__init__(env, weight)
 
     def _compute(self) -> tuple[torch.Tensor, torch.Tensor]:
         is_active = torch.arange(self.num_envs, device=self.device) % 2 == 1
@@ -243,8 +243,8 @@ class evade_distance(Reward[Game]):
 class chase_distance(Reward[Game]):
     namespace = "game"
 
-    def __init__(self, env, weight: float, enabled: bool = True):
-        super().__init__(env, weight, enabled)
+    def __init__(self, env, weight: float):
+        super().__init__(env, weight)
 
     def _compute(self) -> tuple[torch.Tensor, torch.Tensor]:
         is_active = torch.arange(self.num_envs, device=self.device) % 2 == 0
@@ -255,8 +255,8 @@ class chase_distance(Reward[Game]):
 class target_in_sight(Reward[Game]):
     namespace = "game"
 
-    def __init__(self, env, weight: float, enabled: bool = True):
-        super().__init__(env, weight, enabled)
+    def __init__(self, env, weight: float):
+        super().__init__(env, weight)
         self.asset = self.command_manager.asset
 
     def _compute(self) -> torch.Tensor:
@@ -281,8 +281,8 @@ class caught_reward(Reward[Game]):
 class stall_penalty(Reward[Game]):
     namespace = "game"
 
-    def __init__(self, env, weight: float, enabled: bool = True):
-        super().__init__(env, weight, enabled)
+    def __init__(self, env, weight: float):
+        super().__init__(env, weight)
         self.asset = self.command_manager.asset
 
     def _compute(self) -> tuple[torch.Tensor, torch.Tensor]:

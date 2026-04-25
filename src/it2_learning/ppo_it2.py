@@ -49,13 +49,7 @@ from active_adaptation.learning.modules import (
     VecNorm,
     MLP,
 )
-from active_adaptation.utils.math import (
-    quat_rotate_inverse,
-    quat_mul,
-    quat_conjugate,
-    euler_from_quat,
-    wrap_to_pi,
-)
+from active_adaptation.utils.math import quat_rotate_inverse
 from active_adaptation.learning.utils.opt import MuonAdamWWrapper
 from active_adaptation.learning.utils.distributed import check_parameters
 from active_adaptation.utils.profiling import ScopedTimer
@@ -69,6 +63,7 @@ from active_adaptation.learning.ppo.common import (
 )
 from it2_learning.encoders import EncoderOne, EncoderTwo
 from it2_learning.networks import FuturePredictor
+from it2_learning.future_pred import FutureState, FutureTrajectory
 
 import active_adaptation as aa
 import torch.distributed as distr
@@ -99,6 +94,7 @@ class PPOConfig:
     defm_variant: str = "defm_resnet18"  # or "defm_regnet_y_400mf"
     defm_pretrained: bool = True
     future_pred_dim: int = 7
+    future_label_mode: str = "state7"
     future_pred_coef: float = 0.0
     future_pred_minibatches: int = 4
     future_latent_dim: int = 16
@@ -184,6 +180,10 @@ class PPOPolicy(TensorDictModuleBase):
             defm_pretrained=self.cfg.defm_pretrained,
         ).to(self.device)
 
+        self.relabeler = FutureState(
+            mode=self.cfg.future_label_mode,
+            horizon=self.cfg.train_every,
+        )
         self.future_predictor = FuturePredictor(
             context_dim=self.fusion_encoder.output_dim,
             pred_dim=self.cfg.future_pred_dim,
@@ -395,31 +395,12 @@ class PPOPolicy(TensorDictModuleBase):
     
     def train_future_prediction(self, tensordict: TensorDict):
         self.fusion_encoder.requires_grad_(False) # freeze the fusion encoder
-        eid = tensordict["episode_id"]
-        prev_eid = self.prev_tensordict["episode_id"] # (N, T)
-        root_state_w = tensordict.get("root_state_w")
-        prev_root_state_w = self.prev_tensordict.get("root_state_w")
-        same_episode = (eid == prev_eid).reshape_as(tensordict["is_init"]) # (N, T, 1)
-        valid_mask = same_episode & (~tensordict["is_init"]) & (~self.prev_tensordict["is_init"])
-
-        prev_pos = prev_root_state_w[..., :3]
-        prev_quat = prev_root_state_w[..., 3:7]
-        curr_pos = root_state_w[..., :3]
-        curr_quat = root_state_w[..., 3:7]
-        curr_linvel = root_state_w[..., 7:10]
-
-        # convert to relative
-        rel_pos = quat_rotate_inverse(prev_quat, curr_pos - prev_pos)
-        rel_quat = quat_mul(quat_conjugate(prev_quat), curr_quat)
-        rel_yaw = wrap_to_pi(euler_from_quat(rel_quat)[..., 2]).unsqueeze(-1)
-        rel_linvel = quat_rotate_inverse(prev_quat, curr_linvel)
-        target = torch.cat([rel_pos, rel_yaw, rel_linvel], dim=-1)
-        future_td = self.prev_tensordict.select(CMD_KEY, OBS_KEY, "extero").copy()
-        future_td["_future_target"] = target
-        future_td["_future_valid"] = valid_mask
+        # concat along the time axis
+        _tensordict = torch.cat([self.prev_tensordict, tensordict], dim=1)
+        _tensordict = self.relabeler.relabel(_tensordict)
 
         infos = []
-        for minibatch in make_batch(future_td, self.cfg.future_pred_minibatches):
+        for minibatch in make_batch(_tensordict, self.cfg.future_pred_minibatches):
             self.run_policy(minibatch, future_prediction=True)
             loss, meta = self.future_predictor.compute_loss(
                 minibatch["_proprio_context"],
@@ -427,7 +408,7 @@ class PPOPolicy(TensorDictModuleBase):
                 minibatch["_future_target"],
                 self.cfg.future_kl_coef,
                 prior_kl_coef=self.cfg.future_prior_kl_coef,
-                valid_mask=minibatch.get("_future_valid"),
+                valid_mask=minibatch["_future_valid"],
             )
             self.opt_future.zero_grad(set_to_none=True)
             loss.backward()
@@ -442,7 +423,7 @@ class PPOPolicy(TensorDictModuleBase):
         self.fusion_encoder.requires_grad_(True)
         infos = pytree.tree_map(lambda *xs: sum(xs).item() / len(xs), *infos)
         infos["future/param_diff"] = check_parameters(self.future_predictor)
-        infos["future/valid_ratio"] = valid_mask.float().mean().detach().item()
+        infos["future/valid_ratio"] = _tensordict["_future_valid"].float().mean().item()
         return infos
     
     def train_distillation(self, tensordict: TensorDict):

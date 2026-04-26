@@ -5,14 +5,16 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.nn.parallel import DistributedDataParallel as DDP
-# Prior/posterior heads emit ``(mu, rho)``; ``logvar = softplus(rho) + logvar_min`` so variance has a
-# positive floor and KL denominators stay bounded.
-_LOGVAR_MIN = math.log(1e-6)
+
+
+# ``F.softplus(0) = log(2)``; we normalize so that ``ρ = 0`` gives ``var = 1`` (``std = 1``) per dim.
+_LOG2 = math.log(2.0)
 
 
 def gaussian_moments_from_head(out: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
     mu, rho = out.chunk(2, dim=-1)
-    logvar = F.softplus(rho) + _LOGVAR_MIN
+    var = F.softplus(rho, beta=_LOG2)
+    logvar = var.clamp_min(1e-8).log()
     return mu, logvar
 
 
@@ -40,9 +42,12 @@ def entropy_gaussian(
     logvar: torch.Tensor,
 ) -> torch.Tensor:
     """
-    Compute the entropy of a Gaussian distribution.
+    Differential entropy of a diagonal Gaussian, in nats, **summed** over the last axis.
 
-    Sum over the last (event) dimension.
+    For ``d`` independent dimensions, ``H = 0.5 * sum_i (1 + log(2π) + log σ²_i)``. With
+    small per-dim variances (large negative ``logvar``), the **total** is often a large
+    **negative** number—this is normal, not a sign bug. For interpretability, divide the
+    logged training metrics by ``latent_dim`` to get a per-dimension scale.
     """
     # H = 0.5 * sum_i (1 + log(2*pi) + logvar_i) for diagonal N(mu, diag(exp(logvar))).
     two_pi = mu.new_tensor(2.0 * torch.pi)
@@ -101,7 +106,7 @@ class FuturePredictor(nn.Module):
         self.reset_parameters()
 
     def reset_parameters(self):
-        """Match PPO-style orthogonal inits; mild negative bias on ``rho`` for stable initial variance."""
+        """PPO-style orthogonal inits. ``rho`` (second head half) stays zero-biased so initial per-dim ``std ≈ 1`` (see :func:`gaussian_moments_from_head`)."""
 
         def orth_linear(m: nn.Linear, gain: float) -> None:
             nn.init.orthogonal_(m.weight, gain)
@@ -119,8 +124,6 @@ class FuturePredictor(nn.Module):
                 orth_linear(lin, 0.1)
             last = linears[-1]
             orth_linear(last, 0.02)
-            if last.bias is not None:
-                last.bias.data[self.latent_dim :].fill_(-1.0)
 
         with torch.no_grad():
             self.query_embedding.weight.normal_(0.0, 0.02)
@@ -290,6 +293,7 @@ class FuturePredictor(nn.Module):
             entropy_posterior_mean = entropy_posterior.mean()
 
         rw = recon_weight.clamp_min(1.0)
+        ld = float(self.latent_dim)
         info = {
             "future/pred_loss": sqerr / rw,
             "future/KL(q(z|o_ext,y)||p(z|o_ext))": kl_sum / rw,
@@ -298,5 +302,9 @@ class FuturePredictor(nn.Module):
             "future/H[p(z|o_pro)]": entropy_prior_proprio_mean.detach(),
             "future/H[p(z|o_ext)]": entropy_prior_extero_mean.detach(),
             "future/H[q(z|o_ext,y)]": entropy_posterior_mean.detach(),
+            # Same as above, but total nats / latent_dim (typical range O(1) when not collapsed)
+            "future/nats_per_latent/p(z|o_pro)": (entropy_prior_proprio_mean / ld).detach(),
+            "future/nats_per_latent/p(z|o_ext)": (entropy_prior_extero_mean / ld).detach(),
+            "future/nats_per_latent/q(z|o_ext,y)": (entropy_posterior_mean / ld).detach(),
         }
         return loss, info

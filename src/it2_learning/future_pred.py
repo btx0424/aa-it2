@@ -11,10 +11,9 @@ position overlays without depending on the mode name.
 
 - ``_future_target``: predicted quantity at each output time.
 - ``_future_valid``: boolean mask, shape ``(N, t_out)``, same time layout as
-  ``_future_target``. Per output time ``t``, it marks whether the future label is
-  considered valid for training (no episode break inside the compared span); see
-  :meth:`FutureState.relabel` and :meth:`FutureTrajectory.relabel` for the exact
-  predicate. Loss code can weight or mask on this tensor.
+  ``_future_target`` (with ``t_out = T - H`` for :class:`FutureState`). Per output
+  time ``t``, it marks valid training when start and H-step target share an episode; see
+  each ``relabel`` for the predicate. Loss code can weight or mask on this tensor.
 """
 
 from __future__ import annotations
@@ -51,32 +50,35 @@ class FutureState:
     def relabel(self, tensordict: TensorDict) -> TensorDict:
         """Slice to ``t_out = T - H + 1`` and add ``_future_target`` / ``_future_valid``.
 
-        The future label is the root state at time ``t + H`` relative to the reference
-        at ``t``.
+        The future label is the root state at time ``t + H`` (after **H** forward steps
+        along the rollout axis) relative to the reference at ``t``. This matches a usual
+        ``train_every=H`` notion of "H steps into the future" for overlays. Uses
+        ``t_out = T - H`` so ``t + H`` never exceeds the last time index (requires ``T > H``).
 
         ``_future_valid`` is a boolean tensor with shape ``(N, t_out)``. Index ``t`` is
-        True when ``episode_id[:, t] == episode_id[:, t + H - 1]``, so the loss can
-        ignore pairs that straddle a reset.
+        True when ``episode_id[:, t] == episode_id[:, t + H]`` so the loss can ignore
+        pairs that straddle a reset.
         """
         N, T = tensordict.shape[:2]
         H = self.horizon
-        t_out = T - H + 1
+        t_out = T - H
         if t_out < 1:
-            raise ValueError(f"T - H + 1 = {t_out} < 1")
+            raise ValueError(
+                f"T - H = {t_out} < 1: need more time steps than the horizon (T={T}, H={H})"
+            )
         result = tensordict[:, :t_out]
         future_targets: list[torch.Tensor] = []
         valid_masks: list[torch.Tensor] = []
         for t in range(t_out):
             root_state_ref = tensordict["root_state_w"][:, t]
-            root_state_future = tensordict["root_state_w"][:, t + H-1]
+            root_state_future = tensordict["root_state_w"][:, t + H]
             rel_kinematics = relative_kinematics(
-                root_state_future.unsqueeze(1),
-                root_state_ref,
+                root_state=root_state_future.unsqueeze(1),
+                root_state_ref=root_state_ref,
             )
             future_target = torch.cat([rel_kinematics[k] for k in self.keys], dim=-1)
             future_targets.append(future_target)
-            # whether t and t+H-1 belong to the same episode
-            valid = tensordict["episode_id"][:, t] == tensordict["episode_id"][:, t + H-1]
+            valid = tensordict["episode_id"][:, t] == tensordict["episode_id"][:, t + H]
             valid_masks.append(valid)
         result["_future_target"] = torch.stack(future_targets, dim=1).reshape(N, t_out, self.dim)
         result["_future_valid"] = torch.stack(valid_masks, dim=1)
@@ -97,7 +99,9 @@ class FutureTrajectory:
     def relabel(self, tensordict: TensorDict) -> TensorDict:
         """Slice to ``t_out = T - H + 1`` and add ``_future_target`` / ``_future_valid``.
 
-        The target stacks relative kinematics for each time in ``[t, t + H)``.
+        The target stacks relative kinematics for each time in ``[t, t + H)``, then flattens
+        to the last axis as ``H * self.dim`` (use a head with ``pred_dim = H * self.dim`` in
+        that mode, e.g. 7*H for ``state7``).
 
         ``_future_valid`` is a boolean ``(N, t_out)`` tensor. At output time ``t`` it is
         True when ``episode_id`` at the window start and end match,
@@ -124,7 +128,10 @@ class FutureTrajectory:
             # whether t and t+H-1 belong to the same episode
             valid = tensordict["episode_id"][:, t] == tensordict["episode_id"][:, t + H-1]
             valid_masks.append(valid)
-        result["_future_target"] = torch.stack(future_targets, dim=1).reshape(N, t_out, t_out * self.dim)
+        # (N, t_out, H, self.dim) -> flatten trajectory per time for a fixed H * self.dim head
+        result["_future_target"] = torch.stack(future_targets, dim=1).reshape(
+            N, t_out, H * self.dim
+        )
         result["_future_valid"] = torch.stack(valid_masks, dim=1)
         return result
 

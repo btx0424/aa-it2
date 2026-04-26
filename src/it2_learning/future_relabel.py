@@ -18,6 +18,7 @@ position overlays without depending on the mode name.
 
 from __future__ import annotations
 
+from abc import ABC, abstractmethod
 import torch
 from jaxtyping import Float
 from tensordict import TensorDict
@@ -36,13 +37,28 @@ FUTURE_LABEL_MODES: dict[str, tuple[int, tuple[str, ...]]] = {
 }
 
 
-class FutureState:
-    def __init__(self, mode: str, horizon: int):
+class FutureRelabel(ABC):
+    """Build ``_future_target`` and ``_future_valid`` from ``root_state_w`` (and friends)."""
+
+    mode: str
+    horizon: int
+    dim: int
+    keys: tuple[str, ...]
+
+    @abstractmethod
+    def relabel(self, tensordict: TensorDict) -> TensorDict:
+        """Return a sliced tensordict with ``_future_target`` and ``_future_valid``."""
+        ...
+
+
+class FutureState(FutureRelabel):
+
+    def __init__(self, mode: str, horizon: int) -> None:
         self.mode = mode
         self.horizon = horizon
         if self.mode not in FUTURE_LABEL_MODES:
             raise ValueError(
-                f"Unknown FutureState mode {self.mode!r}. "
+                f"Unknown future label mode {self.mode!r}. "
                 f"Expected one of {list(FUTURE_LABEL_MODES)}"
             )
         self.dim, self.keys = FUTURE_LABEL_MODES[self.mode]
@@ -80,21 +96,24 @@ class FutureState:
             future_targets.append(future_target)
             valid = tensordict["episode_id"][:, t] == tensordict["episode_id"][:, t + H]
             valid_masks.append(valid)
-        result["_future_target"] = torch.stack(future_targets, dim=1).reshape(N, t_out, self.dim)
+        result["_future_target"] = torch.stack(future_targets, dim=1).reshape(
+            N, t_out, self.dim
+        )
         result["_future_valid"] = torch.stack(valid_masks, dim=1)
         return result
 
 
-class FutureTrajectory:
-    def __init__(self, mode: str, horizon: int):
+class FutureTrajectory(FutureRelabel):
+    def __init__(self, mode: str, horizon: int) -> None:
         self.mode = mode
         self.horizon = horizon
         if self.mode not in FUTURE_LABEL_MODES:
             raise ValueError(
-                f"Unknown FutureTrajectory mode {self.mode!r}. "
+                f"Unknown future label mode {self.mode!r}. "
                 f"Expected one of {list(FUTURE_LABEL_MODES)}"
             )
         self.dim, self.keys = FUTURE_LABEL_MODES[self.mode]
+        self.dim = self.dim * self.horizon
 
     def relabel(self, tensordict: TensorDict) -> TensorDict:
         """Slice to ``t_out = T - H + 1`` and add ``_future_target`` / ``_future_valid``.
@@ -126,11 +145,13 @@ class FutureTrajectory:
             future_target = torch.cat([rel_kinematics[k] for k in self.keys], dim=-1)
             future_targets.append(future_target)
             # whether t and t+H-1 belong to the same episode
-            valid = tensordict["episode_id"][:, t] == tensordict["episode_id"][:, t + H-1]
+            valid = (
+                tensordict["episode_id"][:, t] == tensordict["episode_id"][:, t + H - 1]
+            )
             valid_masks.append(valid)
         # (N, t_out, H, self.dim) -> flatten trajectory per time for a fixed H * self.dim head
         result["_future_target"] = torch.stack(future_targets, dim=1).reshape(
-            N, t_out, H * self.dim
+            N, t_out, self.dim
         )
         result["_future_valid"] = torch.stack(valid_masks, dim=1)
         return result

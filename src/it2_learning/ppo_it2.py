@@ -19,7 +19,7 @@
 # LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
-
+from __future__ import annotations
 
 import torch
 import torch.nn as nn
@@ -40,7 +40,7 @@ from tensordict.nn import (
 )
 
 from hydra.core.config_store import ConfigStore
-from dataclasses import dataclass, asdict
+from dataclasses import dataclass, asdict, field
 from typing import Union, Tuple, Literal
 from collections import OrderedDict
 
@@ -62,12 +62,37 @@ from active_adaptation.learning.ppo.common import (
     CMD_KEY, OBS_KEY, ACTION_KEY, REWARD_KEY, TERM_KEY, DONE_KEY,
 )
 from it2_learning.encoders import EncoderOne, EncoderTwo
-from it2_learning.networks import FuturePredictor
-from it2_learning.future_pred import FutureState, FutureTrajectory
+from it2_learning.future_pred import VAEFuturePredictor, CFMFuturePredictor
+from it2_learning.future_relabel import FutureRelabel,FutureState, FutureTrajectory
 
 import active_adaptation as aa
 import torch.distributed as distr
 from torch.nn.parallel import DistributedDataParallel as DDP
+
+
+@dataclass
+class FuturePredictorConfig:
+    predictor: str
+    relabeler: str = "FutureState"
+    relabel_mode: str = "state7"
+
+
+@dataclass
+class VAEFuturePredictorConfig(FuturePredictorConfig):
+    predictor: str = "VAE"
+    relabeler: str = "FutureState"
+    relabel_mode: str = "state7"
+    latent_dim: int = 16
+    kl_coef: float = 0.02
+    prior_kl_coef: float = 0.5
+
+
+@dataclass
+class CFMFuturePredictorConfig(FuturePredictorConfig):
+    predictor: str = "CFM"
+    relabeler: str = "FutureTrajectory"
+    relabel_mode: str = "state7"
+
 
 @dataclass
 class PPOConfig:
@@ -93,20 +118,25 @@ class PPOConfig:
     extero_encoder: str = "cnn" # or "defm_cnn"
     defm_variant: str = "defm_resnet18"  # or "defm_regnet_y_400mf"
     defm_pretrained: bool = True
-    future_pred_dim: int = 7
-    future_label_mode: str = "state7"
-    future_pred_coef: float = 0.0
+    future_pred_coef: float = 1.0
     future_pred_minibatches: int = 4
-    future_latent_dim: int = 16
-    future_kl_coef: float = 0.02
-    future_prior_kl_coef: float = 0.5
+    future_predictor: FuturePredictorConfig = field(default_factory=VAEFuturePredictorConfig)
     stages: Tuple[str, ...] = ("policy", "future")
 
 
 cs = ConfigStore.instance()
 cs.store("ppo_it2", node=PPOConfig(stages=("policy",)), group="algo")
 cs.store("ppo_it2_future", node=PPOConfig(stages=("future",), future_pred_coef=1.0), group="algo")
-
+cs.store(
+    "ppo_it2_future_vae",
+    node=PPOConfig(stages=("future",), future_predictor=VAEFuturePredictorConfig()),
+    group="algo"
+)
+cs.store(
+    "ppo_it2_future_cfm",
+    node=PPOConfig(stages=("future",), future_predictor=CFMFuturePredictorConfig()),
+    group="algo"
+)
 
 class PPOPolicy(TensorDictModuleBase):
 
@@ -180,16 +210,30 @@ class PPOPolicy(TensorDictModuleBase):
             defm_pretrained=self.cfg.defm_pretrained,
         ).to(self.device)
 
-        self.relabeler = FutureState(
-            mode=self.cfg.future_label_mode,
+        # construct the relabeler and future predictor
+        self.relabeler: FutureRelabel = {
+            "FutureState": FutureState,
+            "FutureTrajectory": FutureTrajectory,
+        }[self.cfg.future_predictor.relabeler](
+            mode=self.cfg.future_predictor.relabel_mode,
             horizon=self.cfg.train_every,
         )
-        self.future_predictor = FuturePredictor(
-            context_dim=self.fusion_encoder.output_dim,
-            pred_dim=self.cfg.future_pred_dim,
-            latent_dim=self.cfg.future_latent_dim,
-        ).to(self.device)
-        
+
+        if self.cfg.future_predictor.predictor == "VAE":
+            self.future_predictor = VAEFuturePredictor(
+                context_dim=self.fusion_encoder.output_dim,
+                pred_dim=self.relabeler.dim,
+                latent_dim=self.cfg.future_predictor.latent_dim,
+                kl_coef=self.cfg.future_predictor.kl_coef,
+            ).to(self.device)
+        elif self.cfg.future_predictor.predictor == "CFM":
+            self.future_predictor = CFMFuturePredictor(
+                context_dim=self.fusion_encoder.output_dim,
+                pred_dim=self.relabeler.dim,
+            ).to(self.device)
+        else:
+            raise ValueError(f"Unknown future predictor: {self.cfg.future_predictor.predictor}")
+
         actor_module = TDMod(_actor, ["_shared_feature"], ["loc", "scale"])
         critic_module = TDMod(_critic, ["_shared_feature"], ["state_value"])
 
@@ -203,7 +247,8 @@ class PPOPolicy(TensorDictModuleBase):
 
         self.critic = critic_module.to(self.device)
 
-        self.run_policy(fake_input, True, True)
+        with torch.no_grad():
+            self.run_policy(fake_input, True, True)
         
         def init_(module):
             if getattr(module, "_defm_no_reinit", False):
@@ -322,14 +367,14 @@ class PPOPolicy(TensorDictModuleBase):
             [
                 {"params": self.future_predictor.parameters()},
             ],
-            lr=1e-4,
+            lr=5e-4,
             weight_decay=0.01,
         )
         self.opt_distill = torch.optim.AdamW(
             [
                 {"params": self.distill_cmd_encoder.parameters()},
             ],
-            lr=3e-4,
+            lr=5e-4,
             weight_decay=0.01,
         )
         # Setup mixed precision training
@@ -406,8 +451,6 @@ class PPOPolicy(TensorDictModuleBase):
                 minibatch["_proprio_context"],
                 minibatch["_extero_context"],
                 minibatch["_future_target"],
-                self.cfg.future_kl_coef,
-                prior_kl_coef=self.cfg.future_prior_kl_coef,
                 valid_mask=minibatch["_future_valid"],
             )
             self.opt_future.zero_grad(set_to_none=True)
@@ -415,7 +458,7 @@ class PPOPolicy(TensorDictModuleBase):
             if aa.is_distributed() and not self.cfg.use_ddp:
                 allreduce_grads(self.future_predictor.parameters())
 
-            grad_norm = nn.utils.clip_grad_norm_(self.future_predictor.parameters(), self.max_grad_norm)
+            grad_norm = nn.utils.clip_grad_norm_(self.future_predictor.parameters(), 2.0)
             self.opt_future.step()
 
             infos.append({"future/grad_norm": grad_norm, **meta})

@@ -409,7 +409,8 @@ class VAEFuturePredictor(nn.Module):
         assert pred.shape == target.shape
         sq_err = (pred - target) ** 2
         sq_err[..., 3:4] = sq_err[..., 3:4] / torch.pi
-        likelihood = sq_err.sum(dim=(-1, -2))
+        # Average over target dimensions so FutureState and FutureTrajectory have comparable loss scale.
+        likelihood = sq_err.mean(dim=(-1, -2))
 
         per_term = likelihood + self.kl_coef * kl_posterior + prior_kl_coef * kl_prior
 

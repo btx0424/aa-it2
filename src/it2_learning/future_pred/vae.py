@@ -231,19 +231,12 @@ class VAEFuturePredictor(nn.Module):
         self.reset_parameters()
 
     def reset_parameters(self):
-        """PPO-style orthogonal inits. ``rho`` (second head half) stays zero-biased so initial per-dim ``std ≈ 1`` (see :func:`gaussian_moments_from_head`)."""
+        """Initialize only latent Gaussian heads; keep target encoder/decoder defaults."""
 
         def orth_linear(m: nn.Linear, gain: float) -> None:
             nn.init.orthogonal_(m.weight, gain)
             if m.bias is not None:
                 nn.init.zeros_(m.bias)
-
-        def reset_layernorms(seq: nn.Sequential) -> None:
-            for m in seq.modules():
-                if isinstance(m, nn.LayerNorm):
-                    m.reset_parameters()
-                elif isinstance(m, nn.GroupNorm):
-                    m.reset_parameters()
 
         def init_gaussian_mlp(seq: nn.Sequential) -> None:
             linears = [m for m in seq if isinstance(m, nn.Linear)]
@@ -256,23 +249,6 @@ class VAEFuturePredictor(nn.Module):
             self.query_embedding.weight.normal_(0.0, 0.02)
         init_gaussian_mlp(self.prior)
         init_gaussian_mlp(self.posterior)
-        reset_layernorms(self.prior)
-        reset_layernorms(self.posterior)
-
-        for m in self.target_encoder.modules():
-            if isinstance(m, (nn.Conv1d, nn.Linear)):
-                nn.init.orthogonal_(m.weight, 0.02)
-                if m.bias is not None:
-                    nn.init.zeros_(m.bias)
-        for m in self.decoder.modules():
-            if isinstance(m, nn.Linear):
-                orth_linear(m, 0.02)
-            elif isinstance(m, (nn.Conv1d, nn.ConvTranspose1d)):
-                nn.init.orthogonal_(m.weight, 0.02)
-                if m.bias is not None:
-                    nn.init.zeros_(m.bias)
-        reset_layernorms(self.target_encoder)
-        reset_layernorms(self.decoder)
 
     def wrap_DDP(self, device_ids: list[int]):
         self.query_embedding = DDP(self.query_embedding, device_ids=device_ids)

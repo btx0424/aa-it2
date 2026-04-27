@@ -55,6 +55,13 @@ class Game(Command):
 
             self.distance_traveled = torch.zeros(self.num_envs, 1)
 
+            self.init_angle_range = torch.zeros(self.origins.shape[0], 2)
+            self.init_angle_range[:, 0] = -torch.pi
+            self.init_angle_range[:, 1] = torch.pi
+            is_corridor = self.terrain_generator.sub_terrain_types == self.terrain_generator.sub_terrain_type_mapping.get("curved_corridor", -1)
+            self.init_angle_range[is_corridor, 0] = 0.0
+            self.init_angle_range[is_corridor, 1] = 0.0
+
         if self.env.sim.has_gui() and self.env.backend == "isaac":
             self.marker = self.scene.create_arrow_marker(
                 prim_path="/Visuals/Command/arrow",
@@ -110,8 +117,9 @@ class Game(Command):
         origins = self.origins[idx]
 
         init_pos = origins[chase]
-        angle = torch.rand(len(init_pos), device=self.device) * 2 * torch.pi
-        radius = (torch.rand(len(init_pos), device=self.device) + 1.0).unsqueeze(1)
+        angle_start, angle_end = self.init_angle_range[env_ids[chase]].unbind(1)
+        angle = torch.rand(len(init_pos), device=self.device) * (angle_end - angle_start) + angle_start
+        radius = (torch.rand(len(init_pos), device=self.device) + 0.8).unsqueeze(1)
         offset = torch.stack([torch.cos(angle), torch.sin(angle), torch.zeros_like(angle)], dim=-1) * radius
         init_root_state[chase, :3] += init_pos + offset
         init_root_state[~chase, :3] += init_pos - offset
@@ -192,13 +200,14 @@ class chase_velocity(Reward[Game]):
     def __init__(self, env, weight: float):
         super().__init__(env, weight)
         self.asset = self.command_manager.asset
+        self.a = 2.0
 
     def _compute(self) -> tuple[torch.Tensor, torch.Tensor]:
         is_chaser = self.command_manager.role[:, None] == 0
         direction = normalize(self.command_manager.target_diff[:, :2])
         velocity = self.asset.data.root_link_lin_vel_w[:, :2]
         rew = torch.sum(direction * velocity, dim=1, keepdim=True)
-        rew = torch.where(rew > 0, rew.log1p(), rew)
+        rew = torch.where(rew > 0, self.a * torch.arctan(rew / self.a), rew)
         return rew.reshape(self.num_envs, 1), is_chaser.reshape(self.num_envs, 1)
 
 
@@ -208,6 +217,7 @@ class evade_velocity(Reward[Game]):
     def __init__(self, env, weight: float):
         super().__init__(env, weight)
         self.asset = self.command_manager.asset
+        self.a = 2.0
 
     def _compute(self) -> tuple[torch.Tensor, torch.Tensor]:
         is_evader = self.command_manager.role[:, None] == 1
@@ -215,7 +225,7 @@ class evade_velocity(Reward[Game]):
         velocity = self.asset.data.root_link_lin_vel_w[:, :2]
         # reward moving away from the chaser (negative projection of velocity on diff)
         rew = -torch.sum(direction * velocity, dim=1, keepdim=True)
-        rew = torch.where(rew > 0, rew.log1p(), rew)
+        rew = torch.where(rew > 0, self.a * torch.arctan(rew / self.a), rew)
         return rew.reshape(self.num_envs, 1), is_evader.reshape(self.num_envs, 1)
 
 

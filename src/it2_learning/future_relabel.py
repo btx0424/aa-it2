@@ -123,6 +123,8 @@ class FutureTrajectory(FutureRelabel):
         self.decimation = decimation
         if decimation < 1:
             raise ValueError(f"decimation must be >= 1, got {decimation}")
+        if horizon % decimation != 0:
+            raise ValueError(f"horizon must be divisible by decimation, got {horizon} and {decimation}")
         if self.mode not in FUTURE_LABEL_MODES:
             raise ValueError(
                 f"Unknown future label mode {self.mode!r}. "
@@ -162,7 +164,7 @@ class FutureTrajectory(FutureRelabel):
             future_targets.append(future_target)
             # whether t and t+H-1 belong to the same episode
             episode_id = tensordict["episode_id"]
-            valid = episode_id[:, t] = episode_id[:, t + H - 1]
+            valid = episode_id[:, t] == episode_id[:, t + H - 1]
             valid_masks.append(valid)
         # (N, t_out, H // decimation, state_dim) -> flatten trajectory per time for a fixed H * state_dim head
         future_targets = torch.stack(future_targets, dim=1)

@@ -116,17 +116,20 @@ class FutureState(FutureRelabel):
 
 class FutureTrajectory(FutureRelabel):
 
-    def __init__(self, mode: str, horizon: int) -> None:
+    def __init__(self, mode: str, horizon: int, decimation: int = 1) -> None:
         super().__init__()
         self.mode = mode
         self.horizon = horizon
+        self.decimation = decimation
+        if decimation < 1:
+            raise ValueError(f"decimation must be >= 1, got {decimation}")
         if self.mode not in FUTURE_LABEL_MODES:
             raise ValueError(
                 f"Unknown future label mode {self.mode!r}. "
                 f"Expected one of {list(FUTURE_LABEL_MODES)}"
             )
         state_dim, self.keys = FUTURE_LABEL_MODES[self.mode]
-        self.target_shape = torch.Size((self.horizon, state_dim))
+        self.target_shape = torch.Size((self.horizon // self.decimation, state_dim))
         self.vecnorm = VecNorm(self.target_shape, decay=1.0)
 
     def relabel(self, tensordict: TensorDict, normalize: bool = True) -> TensorDict:
@@ -150,7 +153,7 @@ class FutureTrajectory(FutureRelabel):
         valid_masks: list[torch.Tensor] = []
         for t in range(t_out):
             root_state_ref = tensordict["root_state_w"][:, t]
-            root_state_future = tensordict["root_state_w"][:, t : t + H]
+            root_state_future = tensordict["root_state_w"][:, t : t + H : self.decimation]
             rel_kinematics = relative_kinematics(
                 root_state_future,
                 root_state_ref,
@@ -158,16 +161,15 @@ class FutureTrajectory(FutureRelabel):
             future_target = torch.cat([rel_kinematics[k] for k in self.keys], dim=-1)
             future_targets.append(future_target)
             # whether t and t+H-1 belong to the same episode
-            valid = (
-                tensordict["episode_id"][:, t] == tensordict["episode_id"][:, t + H - 1]
-            )
+            episode_id = tensordict["episode_id"]
+            valid = episode_id[:, t] = episode_id[:, t + H - 1]
             valid_masks.append(valid)
-        # (N, t_out, H, self.dim) -> flatten trajectory per time for a fixed H * self.dim head
+        # (N, t_out, H // decimation, state_dim) -> flatten trajectory per time for a fixed H * state_dim head
         future_targets = torch.stack(future_targets, dim=1)
         self.vecnorm._update(future_targets)
         if normalize:
             future_targets = self.vecnorm._normalize(future_targets)
-        result["_future_target"] = future_targets # (N, t_out, H, state_dim)
+        result["_future_target"] = future_targets # (N, t_out, H // decimation, state_dim)
         result["_future_valid"] = torch.stack(valid_masks, dim=1)
         return result
 

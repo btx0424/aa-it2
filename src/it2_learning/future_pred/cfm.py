@@ -151,7 +151,7 @@ class CFMFuturePredictor(nn.Module):
         self,
         context: Float[torch.Tensor, "N context_dim"],
         num_samples: int = 1,
-        steps: int = 10,
+        steps: int = 40,
     ) -> tuple[torch.Tensor, None, torch.Tensor]:
         """Euler integration from :math:`t=0` (noise) to :math:`t=1` (data), same straight
         path and target field as :meth:`compute_loss`: :math:`x_t = (1 - t) x_0 + t x_1`,

@@ -92,7 +92,8 @@ class CFMFuturePredictorConfig(FuturePredictorConfig):
     predictor: str = "CFM"
     relabeler: str = "FutureTrajectory"
     relabel_mode: str = "state7"
-    unet_base_channels: int = 64
+    decimation: int = 2
+    unet_base_channels: int = 32
     unet_channel_mults: Tuple[int, ...] = (1, 2, 4)
     unet_dropout: float = 0.0
 
@@ -214,13 +215,17 @@ class PPOPolicy(TensorDictModuleBase):
         ).to(self.device)
 
         # construct the relabeler and future predictor
-        self.relabeler: FutureRelabel = {
-            "FutureState": FutureState,
-            "FutureTrajectory": FutureTrajectory,
-        }[self.cfg.future_predictor.relabeler](
-            mode=self.cfg.future_predictor.relabel_mode,
-            horizon=self.cfg.train_every,
-        )
+        if self.cfg.future_predictor.relabeler == "FutureTrajectory":
+            self.relabeler = FutureTrajectory(
+                mode=self.cfg.future_predictor.relabel_mode,
+                horizon=self.cfg.train_every,
+                decimation=self.cfg.future_predictor.decimation,
+            )
+        else:
+            self.relabeler = FutureState(
+                mode=self.cfg.future_predictor.relabel_mode,
+                horizon=self.cfg.train_every,
+            )
         self.relabeler.to(self.device)
 
         if self.cfg.future_predictor.predictor == "VAE":
@@ -451,9 +456,11 @@ class PPOPolicy(TensorDictModuleBase):
     
     def train_future_prediction(self, tensordict: TensorDict):
         self.fusion_encoder.requires_grad_(False) # freeze the fusion encoder
-        # concat along the time axis
-        _tensordict = torch.cat([self.prev_tensordict, tensordict], dim=1)
-        _tensordict = self.relabeler.relabel(_tensordict)
+        
+        with ScopedTimer("future_relabel", sync=False):
+            # concat along the time axis
+            _tensordict = torch.cat([self.prev_tensordict, tensordict], dim=1)
+            _tensordict = self.relabeler.relabel(_tensordict)
 
         infos = []
         for minibatch in make_batch(_tensordict, self.cfg.future_pred_minibatches):

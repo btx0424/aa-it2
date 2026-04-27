@@ -5,6 +5,7 @@ import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import einops
 
 
 def sinusoidal_time_embedding_1d(t: torch.Tensor, dim: int) -> torch.Tensor:
@@ -92,11 +93,26 @@ class ConditionalUNet1D(nn.Module):
         channel_mults: tuple[int, ...] = (1, 2, 4),
         cond_dim: int = 256,
         dropout: float = 0.0,
+        trajectory_time_embedding: int = 0,
+        trajectory_length: int | None = None,
     ) -> None:
         super().__init__()
         self.input_dim = input_dim
         self.output_dim = output_dim or input_dim
         self.cond_dim = cond_dim
+        self.trajectory_time_embedding = trajectory_time_embedding
+        self.trajectory_length = trajectory_length
+        if self.trajectory_time_embedding < 0:
+            raise ValueError(
+                f"trajectory_time_embedding must be >= 0, got {self.trajectory_time_embedding}"
+            )
+        if self.trajectory_time_embedding > 0:
+            assert self.trajectory_length is not None
+            assert self.trajectory_time_embedding > 0
+            t = torch.arange(self.trajectory_length, dtype=torch.float32)
+            emb = sinusoidal_time_embedding_1d(t, self.trajectory_time_embedding)
+            self.traj_time_embedding = nn.Parameter(emb) # (T, E)
+            self.traj_time_proj = nn.Linear(self.trajectory_time_embedding, base_channels) # (E, C)
 
         self.cond_proj = nn.Sequential(
             nn.Linear(cond_dim, cond_dim),
@@ -175,10 +191,13 @@ class ConditionalUNet1D(nn.Module):
             raise ValueError(f"x must have shape (B, T, C), got {tuple(x.shape)}")
         batch_size = x.shape[0]
         device, dtype = x.device, x.dtype
-        x = x.transpose(1, 2)
+        x = einops.rearrange(x, "b t c -> b c t")
         cond_vec = self._build_condition(batch_size, device, dtype, cond, t)
 
         h = self.in_conv(x)
+        if self.trajectory_time_embedding > 0:
+            traj_time_emb = self.traj_time_proj(self.traj_time_embedding)
+            h = h + einops.rearrange(traj_time_emb, "t c -> 1 c t")
         skips: list[torch.Tensor] = []
         for idx, block in enumerate(self.down_blocks):
             h = block(h, cond_vec)

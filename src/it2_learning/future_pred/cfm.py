@@ -32,6 +32,7 @@ class CFMVectorField(nn.Module):
         unet_base_channels: int = 64,
         unet_channel_mults: tuple[int, ...] = (1, 2, 4),
         unet_dropout: float = 0.0,
+        trajectory_time_embedding: int = 0,
     ) -> None:
         super().__init__()
         if seq_len <= 4:
@@ -51,6 +52,8 @@ class CFMVectorField(nn.Module):
             channel_mults=unet_channel_mults,
             cond_dim=context_dim,
             dropout=unet_dropout,
+            trajectory_time_embedding=trajectory_time_embedding,
+            trajectory_length=seq_len,
         )
 
     def forward(
@@ -79,6 +82,7 @@ class CFMFuturePredictor(nn.Module):
         unet_base_channels: int = 128,
         unet_channel_mults: tuple[int, ...] = (1, 2, 4),
         unet_dropout: float = 0.0,
+        trajectory_time_embedding: int = 0,
     ):
         super().__init__()
         if len(trajectory_shape) != 2:
@@ -100,6 +104,7 @@ class CFMFuturePredictor(nn.Module):
             unet_base_channels=unet_base_channels,
             unet_channel_mults=unet_channel_mults,
             unet_dropout=unet_dropout,
+            trajectory_time_embedding=trajectory_time_embedding,
         )
 
     def wrap_DDP(self, device_ids: list[int]):

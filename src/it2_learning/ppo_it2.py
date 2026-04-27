@@ -96,6 +96,7 @@ class CFMFuturePredictorConfig(FuturePredictorConfig):
     unet_base_channels: int = 32
     unet_channel_mults: Tuple[int, ...] = (1, 2, 4)
     unet_dropout: float = 0.0
+    trajectory_time_embedding: int = 16
 
 
 @dataclass
@@ -243,6 +244,7 @@ class PPOPolicy(TensorDictModuleBase):
                 unet_base_channels=fp.unet_base_channels,
                 unet_channel_mults=fp.unet_channel_mults,
                 unet_dropout=fp.unet_dropout,
+                trajectory_time_embedding=fp.trajectory_time_embedding,
             ).to(self.device)
         else:
             raise ValueError(f"Unknown future predictor: {self.cfg.future_predictor.predictor}")

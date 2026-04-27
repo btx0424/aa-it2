@@ -57,6 +57,36 @@ class FutureRelabel(nn.Module, ABC):
         return self.vecnorm.denormalize(input_vector)
 
 
+class TwistCommand(FutureRelabel):
+    """Relabel the next state's xy-velocity and yaw velocity as the command for the current step.
+    """
+    def __init__(self):
+        super().__init__()
+        self.target_shape = torch.Size((3,))
+        self.vecnorm = VecNorm(self.target_shape, decay=1.0)
+    
+    def relabel(self, tensordict: TensorDict, normalize: bool = True) -> TensorDict:
+        next_state = tensordict["next", "root_state_w"]
+        next_quat_w = next_state[..., 3:7]
+        next_lin_vel_w = next_state[..., 7:10]
+        next_ang_vel_w = next_state[..., 10:13]
+        next_lin_vel_b = quat_rotate_inverse(next_quat_w, next_lin_vel_w)
+        next_ang_vel_b = quat_rotate_inverse(next_quat_w, next_ang_vel_w)
+        future_target = torch.cat(
+            [next_lin_vel_b[..., :2], next_ang_vel_b[..., 2:3]],
+            dim=-1,
+        )
+        self.vecnorm._update(future_target)
+        if normalize:
+            future_target = self.vecnorm._normalize(future_target)
+        tensordict["_future_target"] = future_target
+        tensordict["_future_valid"] = torch.ones(
+            tensordict.shape,
+            dtype=torch.bool,
+            device=next_state.device,
+        )
+        return tensordict
+
 class FutureState(FutureRelabel):
 
     def __init__(self, mode: str, horizon: int) -> None:

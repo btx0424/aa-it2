@@ -236,8 +236,8 @@ class EncoderTwo(nn.Module):
     3. **Cross-attention**: the query token is the **query**; proprio and extero
        tokens are **keys/values**. The query representation is updated with a
        residual and layer norm (``query_refined``).
-    4. **Aggregate**: concatenate ``query_refined`` with the (post-FFN) proprio and
-       extero tokens and linearly project to ``hidden_dim``.
+    4. **Return** the query-conditioned tokens directly. Downstream heads decide how
+       each slot should be consumed.
 
     The cross-attention step lets the query slot explicitly pull task-relevant
     structure from proprioception and exteroception after they have already mixed
@@ -249,7 +249,6 @@ class EncoderTwo(nn.Module):
         proprio_shape: torch.Size,
         extero_shape: torch.Size,
         token_dim: int = 256,
-        hidden_dim: int = 256,
         num_heads: int = 4,
         activation: Type[nn.Module] = nn.SiLU,
         cnn_norm: Literal["none", "group"] = "none",
@@ -260,7 +259,6 @@ class EncoderTwo(nn.Module):
     ):
         super().__init__()
         self.token_dim = token_dim
-        self.hidden_dim = hidden_dim
         extero_channels = extero_shape[0] if len(extero_shape) == 3 else 1
 
         self.proprio_mlp = MLP([proprio_shape[-1], 256, token_dim], activation=activation, first_non_muon=True)
@@ -283,9 +281,9 @@ class EncoderTwo(nn.Module):
         self.self_attn_norm = nn.LayerNorm(token_dim)
         self.ffn = nn.Sequential(
             nn.LayerNorm(token_dim),
-            nn.Linear(token_dim, hidden_dim),
+            nn.Linear(token_dim, token_dim),
             activation(),
-            nn.Linear(hidden_dim, token_dim),
+            nn.Linear(token_dim, token_dim),
         )
 
         self.cross_attn = nn.MultiheadAttention(
@@ -295,12 +293,7 @@ class EncoderTwo(nn.Module):
         )
         self.cross_attn_norm = nn.LayerNorm(token_dim)
 
-        self.out_proj = nn.Sequential(
-            nn.LayerNorm(token_dim),
-            nn.Linear(token_dim, hidden_dim),
-            activation(),
-        )
-        self.output_dim = hidden_dim
+        self.output_dim = token_dim
 
     def forward(
         self,
@@ -309,7 +302,7 @@ class EncoderTwo(nn.Module):
         extero_inp: Float[torch.Tensor, "... C H W"],
         attn_mask_self: torch.Tensor | None = None,
         attn_mask_cross: torch.Tensor | None = None,
-    ) -> Float[torch.Tensor, "... M hidden_dim"]:
+    ) -> Float[torch.Tensor, "... M token_dim"]:
         batch_shape = queries_inp.shape[:-2]
         N = batch_shape.numel()
         M = queries_inp.shape[-2]
@@ -347,16 +340,14 @@ class EncoderTwo(nn.Module):
                 need_weights=False,
             )
         query_refined = self.cross_attn_norm(query_token + cross_out) # [N, M, self.token_dim]
-
-        fused = self.out_proj(query_refined) # [N, M, self.hidden_dim]
-        return fused.reshape(*batch_shape, M, self.hidden_dim)
+        return query_refined.reshape(*batch_shape, M, self.token_dim)
 
     def forward_policy(
         self,
         policy_query: Float[torch.Tensor, "... 1 token_dim"],
         proprio_inp: Float[torch.Tensor, "... D"],
         extero_inp: Float[torch.Tensor, "... C H W"],
-    ) -> Float[torch.Tensor, "... hidden_dim"]:
+    ) -> Float[torch.Tensor, "... token_dim"]:
         return self(policy_query, proprio_inp, extero_inp)
     
     def forward_policy_future(
@@ -364,7 +355,7 @@ class EncoderTwo(nn.Module):
         queries: Float[torch.Tensor, "... 3 token_dim"],
         proprio_inp: Float[torch.Tensor, "... D"],
         extero_inp: Float[torch.Tensor, "... C H W"],
-    ) -> Float[torch.Tensor, "... 3 hidden_dim"]:
+    ) -> Float[torch.Tensor, "... 3 token_dim"]:
         M = queries.shape[-2]
         assert M == 3, f"EncoderTwo.compute_policy_future_feature expects M==3, got M={M}."
 

@@ -122,7 +122,7 @@ class PPOConfig:
     defm_variant: str = "defm_resnet18"  # or "defm_regnet_y_400mf"
     defm_pretrained: bool = True
     future_pred_coef: float = 1.0
-    future_pred_minibatches: int = 4
+    future_pred_minibatches: int = 8
     future_predictor: FuturePredictorConfig = field(default_factory=VAEFuturePredictorConfig)
     stages: Tuple[str, ...] = ("policy", "future")
 

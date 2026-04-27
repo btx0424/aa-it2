@@ -215,9 +215,9 @@ class VAEFuturePredictor(nn.Module):
 
     def compute_loss(
         self,
-        proprio_context: torch.Tensor,
-        extero_context: torch.Tensor,
-        target: torch.Tensor,
+        proprio_context: torch.Tensor, # (N, C)
+        extero_context: torch.Tensor, # (N, C)
+        target: torch.Tensor, # (N, *target_shape)
         prior_kl_coef: float = 0.5,
         valid_mask: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, dict]:
@@ -236,6 +236,7 @@ class VAEFuturePredictor(nn.Module):
         )
         extero_mu, extero_logvar = gaussian_moments_from_head(self.prior(extero_context))
 
+        target = target.flatten(start_dim=1)
         posterior_in = torch.cat([extero_context, target], dim=-1)
         posterior_mu, posterior_logvar = gaussian_moments_from_head(
             self.posterior(posterior_in)
@@ -263,6 +264,7 @@ class VAEFuturePredictor(nn.Module):
         )
         pred = self.decoder(torch.cat([extero_context, z], dim=-1))
         # yaw is ``target[..., 3:4]`` (relative pos, yaw, linvel); scale its squared error by ``1/pi``.
+        assert pred.shape == target.shape
         sq_err = (pred - target) ** 2
         sq_err[..., 3:4] = sq_err[..., 3:4] / torch.pi
         likelihood = sq_err.sum(dim=-1)

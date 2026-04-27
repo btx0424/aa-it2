@@ -44,7 +44,8 @@ class FutureRelabel(nn.Module, ABC):
 
     mode: str
     horizon: int
-    dim: int
+    shape: torch.Size
+    target_dim: int # total dimension of the future target (e.g., state_dim * horizon for FutureTrajectory)
     keys: tuple[str, ...]
     vecnorm: VecNorm
 
@@ -55,6 +56,10 @@ class FutureRelabel(nn.Module, ABC):
 
     def denormalize(self, input_vector: torch.Tensor):
         return self.vecnorm.denormalize(input_vector)
+    
+    def process_pred(self, pred: torch.Tensor):
+        pred_denorm = self.denormalize(pred)
+        return pred_denorm.unflatten(-1, self.shape)
 
 
 class FutureState(FutureRelabel):
@@ -68,8 +73,10 @@ class FutureState(FutureRelabel):
                 f"Unknown future label mode {self.mode!r}. "
                 f"Expected one of {list(FUTURE_LABEL_MODES)}"
             )
-        self.dim, self.keys = FUTURE_LABEL_MODES[self.mode]
-        self.vecnorm = VecNorm(self.dim, decay=1.0)
+        state_dim, self.keys = FUTURE_LABEL_MODES[self.mode]
+        self.shape = torch.Size((1, state_dim))
+        self.target_dim = self.shape.numel()
+        self.vecnorm = VecNorm(self.target_dim, decay=1.0)
 
     def relabel(self, tensordict: TensorDict, normalize: bool = True) -> TensorDict:
         """Slice to ``t_out = T - H + 1`` and add ``_future_target`` / ``_future_valid``.
@@ -104,7 +111,7 @@ class FutureState(FutureRelabel):
             future_targets.append(future_target)
             valid = tensordict["episode_id"][:, t] == tensordict["episode_id"][:, t + H]
             valid_masks.append(valid)
-        future_targets = torch.stack(future_targets, dim=1).reshape(N, t_out, self.dim)
+        future_targets = torch.stack(future_targets, dim=1).reshape(N, t_out, self.target_dim)
         self.vecnorm._update(future_targets)
         if normalize:
             future_targets = self.vecnorm._normalize(future_targets)
@@ -124,9 +131,10 @@ class FutureTrajectory(FutureRelabel):
                 f"Unknown future label mode {self.mode!r}. "
                 f"Expected one of {list(FUTURE_LABEL_MODES)}"
             )
-        self.dim, self.keys = FUTURE_LABEL_MODES[self.mode]
-        self.dim = self.dim * self.horizon
-        self.vecnorm = VecNorm(self.dim, decay=1.0)
+        state_dim, self.keys = FUTURE_LABEL_MODES[self.mode]
+        self.shape = torch.Size((self.horizon, state_dim))
+        self.target_dim = self.shape.numel()
+        self.vecnorm = VecNorm(self.target_dim, decay=1.0)
 
     def relabel(self, tensordict: TensorDict, normalize: bool = True) -> TensorDict:
         """Slice to ``t_out = T - H + 1`` and add ``_future_target`` / ``_future_valid``.
@@ -163,7 +171,7 @@ class FutureTrajectory(FutureRelabel):
             )
             valid_masks.append(valid)
         # (N, t_out, H, self.dim) -> flatten trajectory per time for a fixed H * self.dim head
-        future_targets = torch.stack(future_targets, dim=1).reshape(N, t_out, self.dim)
+        future_targets = torch.stack(future_targets, dim=1).reshape(N, t_out, self.target_dim)
         self.vecnorm._update(future_targets)
         if normalize:
             future_targets = self.vecnorm._normalize(future_targets)
@@ -182,16 +190,16 @@ def relative_kinematics(
     linvel = root_state[..., 7:10]
     angvel = root_state[..., 10:13]
 
-    pos_ref = root_state_ref[:, :3]
-    quat_ref = root_state_ref[:, 3:7]
+    pos_ref = root_state_ref[:, None, :3]
+    quat_ref = root_state_ref[:, None, 3:7]
     # linvel_ref = root_state_ref[:, 7:10] # unused
     # angvel_ref = root_state_ref[:, 10:13] # unused
 
-    rel_quat = quat_mul(quat_conjugate(quat_ref).unsqueeze(1), quat)  # (N, T, 4)
-    rel_pos = quat_rotate_inverse(rel_quat, pos - pos_ref.unsqueeze(1))  # (N, T, 3)
+    rel_quat = quat_mul(quat_conjugate(quat_ref), quat)  # (N, T, 4)
     rel_yaw = wrap_to_pi(euler_from_quat(rel_quat)[..., 2:3])  # (N, T, 1)
-    rel_linvel = quat_rotate_inverse(rel_quat, linvel)  # (N, T, 3)
-    rel_angvel = quat_rotate_inverse(rel_quat, angvel)  # (N, T, 3)
+    rel_pos = quat_rotate_inverse(quat_ref, pos - pos_ref)  # (N, T, 3)
+    rel_linvel = quat_rotate_inverse(quat_ref, linvel)  # (N, T, 3)
+    rel_angvel = quat_rotate_inverse(quat_ref, angvel)  # (N, T, 3)
 
     return {
         "rel_quat": rel_quat,

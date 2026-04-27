@@ -111,13 +111,14 @@ class Game(Command):
         chase = env_ids % 2 == 0
         init_root_state = self.init_root_state[env_ids]
         
-        idx = torch.randint(
+        origin_indices = torch.randint(
             0, len(self.origins), (num_envs,), device=self.device
         )
-        origins = self.origins[idx]
+        origins = self.origins[origin_indices]
 
         init_pos = origins[chase]
-        angle_start, angle_end = self.init_angle_range[env_ids[chase]].unbind(1)
+        angle_start, angle_end = self.init_angle_range[origin_indices[chase]].unbind(1)
+
         angle = torch.rand(len(init_pos), device=self.device) * (angle_end - angle_start) + angle_start
         radius = (torch.rand(len(init_pos), device=self.device) + 0.8).unsqueeze(1)
         offset = torch.stack([torch.cos(angle), torch.sin(angle), torch.zeros_like(angle)], dim=-1) * radius

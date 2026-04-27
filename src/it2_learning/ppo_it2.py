@@ -223,14 +223,14 @@ class PPOPolicy(TensorDictModuleBase):
         if self.cfg.future_predictor.predictor == "VAE":
             self.future_predictor = VAEFuturePredictor(
                 context_dim=self.fusion_encoder.output_dim,
-                pred_dim=self.relabeler.dim,
+                pred_dim=self.relabeler.target_dim,
                 latent_dim=self.cfg.future_predictor.latent_dim,
                 kl_coef=self.cfg.future_predictor.kl_coef,
             ).to(self.device)
         elif self.cfg.future_predictor.predictor == "CFM":
             self.future_predictor = CFMFuturePredictor(
                 context_dim=self.fusion_encoder.output_dim,
-                pred_dim=self.relabeler.dim,
+                pred_dim=self.relabeler.target_dim,
             ).to(self.device)
         else:
             raise ValueError(f"Unknown future predictor: {self.cfg.future_predictor.predictor}")
@@ -411,8 +411,10 @@ class PPOPolicy(TensorDictModuleBase):
                     num_samples=3,
                 )
                 # print(entropy_0[0], entropy_1[0])
-                tensordict["proprio_pred"] = pred_0[..., :3]
-                tensordict["extero_pred"] = pred_1[..., :3]
+                pred_0 = self.relabeler.process_pred(pred_0[:, 0])
+                pred_1 = self.relabeler.process_pred(pred_1[:, 0])
+                tensordict["proprio_pred"] = pred_0[:, :, :3]
+                tensordict["extero_pred"] = pred_1[:, :, :3]
                 return tensordict
         else:
             policy = functools.partial(self.run_policy, actor=True, critic=critic)

@@ -66,13 +66,15 @@ class VAEFuturePredictor(nn.Module):
     def __init__(
         self,
         context_dim: int,
-        pred_dim: int,
+        target_shape: torch.Size,
         latent_dim: int,
         kl_coef: float,
     ):
         super().__init__()
         self.context_dim = context_dim
-        self.pred_dim = pred_dim
+        if not (target_shape[0] == 1 and len(target_shape) == 2):
+            raise NotImplementedError("VAEFuturePredictor only supports target_shape[0] == 1")
+        self.target_shape = target_shape
         self.latent_dim = latent_dim
         self.kl_coef = kl_coef
 
@@ -90,7 +92,7 @@ class VAEFuturePredictor(nn.Module):
             nn.Linear(256, 2 * latent_dim),
         )
         self.posterior = nn.Sequential(
-            nn.Linear(context_dim + pred_dim, 256),
+            nn.Linear(context_dim + self.target_shape[1], 256),
             nn.SiLU(),
             nn.LayerNorm(256),
             nn.Linear(256, 256),
@@ -103,7 +105,7 @@ class VAEFuturePredictor(nn.Module):
             nn.LayerNorm(256),
             nn.Linear(256, 256),
             nn.SiLU(),
-            nn.Linear(256, pred_dim),
+            nn.Linear(256, self.target_shape[1]),
         )
         self.reset_parameters()
 
@@ -185,9 +187,9 @@ class VAEFuturePredictor(nn.Module):
 
         ``context`` is proprio- or extero-conditioned, matching ``forward``.
 
-        If ``num_samples == 1``, shapes match ``forward``: ``pred`` is ``(..., pred_dim)``,
-        ``z`` is ``(..., latent_dim)``. Otherwise a sample axis is inserted before the last
-        dimension: ``(..., num_samples, pred_dim)`` and ``(..., num_samples, latent_dim)``.
+        If ``num_samples == 1``, shapes match ``forward``: ``pred`` is ``(..., C)`` with
+        ``C = target_shape[-1]``, ``z`` is ``(..., latent_dim)``. Otherwise a sample axis is
+        inserted: ``(..., num_samples, *target_shape)`` and ``(..., num_samples, latent_dim)``.
         """
         mu, logvar = gaussian_moments_from_head(self.prior(context))
         entropy = entropy_gaussian(mu.detach(), logvar.detach())
@@ -208,6 +210,7 @@ class VAEFuturePredictor(nn.Module):
             *context.shape[:-1], num_samples, context.shape[-1]
         )
         pred = self.decoder(torch.cat([ctx, z], dim=-1))
+        pred = pred.reshape(*context.shape[:-1], num_samples, *self.target_shape)
         return pred, z, entropy
 
     def compute_loss(

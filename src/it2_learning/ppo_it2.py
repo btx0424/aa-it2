@@ -92,6 +92,9 @@ class CFMFuturePredictorConfig(FuturePredictorConfig):
     predictor: str = "CFM"
     relabeler: str = "FutureTrajectory"
     relabel_mode: str = "state7"
+    unet_base_channels: int = 64
+    unet_channel_mults: Tuple[int, ...] = (1, 2, 4)
+    unet_dropout: float = 0.0
 
 
 @dataclass
@@ -223,14 +226,18 @@ class PPOPolicy(TensorDictModuleBase):
         if self.cfg.future_predictor.predictor == "VAE":
             self.future_predictor = VAEFuturePredictor(
                 context_dim=self.fusion_encoder.output_dim,
-                pred_dim=self.relabeler.target_dim,
+                target_shape=self.relabeler.target_shape,
                 latent_dim=self.cfg.future_predictor.latent_dim,
                 kl_coef=self.cfg.future_predictor.kl_coef,
             ).to(self.device)
         elif self.cfg.future_predictor.predictor == "CFM":
+            fp: CFMFuturePredictorConfig = self.cfg.future_predictor
             self.future_predictor = CFMFuturePredictor(
                 context_dim=self.fusion_encoder.output_dim,
-                pred_dim=self.relabeler.target_dim,
+                trajectory_shape=self.relabeler.target_shape,
+                unet_base_channels=fp.unet_base_channels,
+                unet_channel_mults=fp.unet_channel_mults,
+                unet_dropout=fp.unet_dropout,
             ).to(self.device)
         else:
             raise ValueError(f"Unknown future predictor: {self.cfg.future_predictor.predictor}")
@@ -411,10 +418,11 @@ class PPOPolicy(TensorDictModuleBase):
                     num_samples=3,
                 )
                 # print(entropy_0[0], entropy_1[0])
-                pred_0 = self.relabeler.process_pred(pred_0[:, 0])
-                pred_1 = self.relabeler.process_pred(pred_1[:, 0])
-                tensordict["proprio_pred"] = pred_0[:, :, :3]
-                tensordict["extero_pred"] = pred_1[:, :, :3]
+                # CFM: (N, T, C); VAE (FutureState): (N, 1, C) after multi-sample slice
+                pred_0 = self.relabeler.denormalize(pred_0[:, 0])
+                pred_1 = self.relabeler.denormalize(pred_1[:, 0])
+                tensordict["proprio_pred"] = pred_0[..., :3]  # rel_pos: leading time axes preserved
+                tensordict["extero_pred"] = pred_1[..., :3]
                 return tensordict
         else:
             policy = functools.partial(self.run_policy, actor=True, critic=critic)

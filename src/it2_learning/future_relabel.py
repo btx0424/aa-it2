@@ -44,8 +44,7 @@ class FutureRelabel(nn.Module, ABC):
 
     mode: str
     horizon: int
-    shape: torch.Size
-    target_dim: int # total dimension of the future target (e.g., state_dim * horizon for FutureTrajectory)
+    target_shape: torch.Size
     keys: tuple[str, ...]
     vecnorm: VecNorm
 
@@ -56,10 +55,6 @@ class FutureRelabel(nn.Module, ABC):
 
     def denormalize(self, input_vector: torch.Tensor):
         return self.vecnorm.denormalize(input_vector)
-    
-    def process_pred(self, pred: torch.Tensor):
-        pred_denorm = self.denormalize(pred)
-        return pred_denorm.unflatten(-1, self.shape)
 
 
 class FutureState(FutureRelabel):
@@ -74,9 +69,8 @@ class FutureState(FutureRelabel):
                 f"Expected one of {list(FUTURE_LABEL_MODES)}"
             )
         state_dim, self.keys = FUTURE_LABEL_MODES[self.mode]
-        self.shape = torch.Size((1, state_dim))
-        self.target_dim = self.shape.numel()
-        self.vecnorm = VecNorm(self.target_dim, decay=1.0)
+        self.target_shape = torch.Size((1, state_dim))
+        self.vecnorm = VecNorm(self.target_shape, decay=1.0)
 
     def relabel(self, tensordict: TensorDict, normalize: bool = True) -> TensorDict:
         """Slice to ``t_out = T - H + 1`` and add ``_future_target`` / ``_future_valid``.
@@ -111,7 +105,7 @@ class FutureState(FutureRelabel):
             future_targets.append(future_target)
             valid = tensordict["episode_id"][:, t] == tensordict["episode_id"][:, t + H]
             valid_masks.append(valid)
-        future_targets = torch.stack(future_targets, dim=1).reshape(N, t_out, self.target_dim)
+        future_targets = torch.stack(future_targets, dim=1).reshape(N, t_out, *self.target_shape)
         self.vecnorm._update(future_targets)
         if normalize:
             future_targets = self.vecnorm._normalize(future_targets)
@@ -132,16 +126,14 @@ class FutureTrajectory(FutureRelabel):
                 f"Expected one of {list(FUTURE_LABEL_MODES)}"
             )
         state_dim, self.keys = FUTURE_LABEL_MODES[self.mode]
-        self.shape = torch.Size((self.horizon, state_dim))
-        self.target_dim = self.shape.numel()
-        self.vecnorm = VecNorm(self.target_dim, decay=1.0)
+        self.target_shape = torch.Size((self.horizon, state_dim))
+        self.vecnorm = VecNorm(self.target_shape, decay=1.0)
 
     def relabel(self, tensordict: TensorDict, normalize: bool = True) -> TensorDict:
         """Slice to ``t_out = T - H + 1`` and add ``_future_target`` / ``_future_valid``.
 
         The target stacks relative kinematics for each time in ``[t, t + H)``, then flattens
-        to the last axis as ``H * self.dim`` (use a head with ``pred_dim = H * self.dim`` in
-        that mode, e.g. 7*H for ``state7``).
+        to shape ``(H, state_dim)`` (``target_shape`` for this relabeler).
 
         ``_future_valid`` is a boolean ``(N, t_out)`` tensor. At output time ``t`` it is
         True when ``episode_id`` at the window start and end match,
@@ -171,11 +163,11 @@ class FutureTrajectory(FutureRelabel):
             )
             valid_masks.append(valid)
         # (N, t_out, H, self.dim) -> flatten trajectory per time for a fixed H * self.dim head
-        future_targets = torch.stack(future_targets, dim=1).reshape(N, t_out, self.target_dim)
+        future_targets = torch.stack(future_targets, dim=1)
         self.vecnorm._update(future_targets)
         if normalize:
             future_targets = self.vecnorm._normalize(future_targets)
-        result["_future_target"] = future_targets
+        result["_future_target"] = future_targets # (N, t_out, H, state_dim)
         result["_future_valid"] = torch.stack(valid_masks, dim=1)
         return result
 

@@ -4,9 +4,10 @@ import math
 from collections import OrderedDict
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 from jaxtyping import Float
 from torch.nn.parallel import DistributedDataParallel as DDP
+
+from it2_learning.networks import ConditionalUNet1D
 
 
 def maybe_unwrap(module: nn.Module):
@@ -15,133 +16,136 @@ def maybe_unwrap(module: nn.Module):
     return module
 
 
-def _time_fourier_features(
-    t: torch.Tensor, num_frequencies: int
-) -> torch.Tensor:
-    """
-    Sinusoids of ``t * 2^i * π`` (``i = 0 … num_frequencies-1``) in sin/cos pairs.
+class CFMVectorField(nn.Module):
+    """``v_θ(x_t, t; c)`` with ``x_t`` of shape ``(N, T, D)`` (batch of trajectories).
 
-    ``t`` is last-dim-1; output last dim is ``2 * num_frequencies`` (suitable for
-    a learned map into ``time_dim``).
-    """
-    freqs = 2.0 ** torch.arange(
-        num_frequencies, device=t.device, dtype=t.dtype
-    ) * (math.pi)
-    # t: (..., 1) * (num_freq,) -> (..., num_frequ)
-    args = t * freqs
-    return torch.cat([args.sin(), args.cos()], dim=-1)
-
-
-class VelocityPredictionModel(nn.Module):
-    """MLP vector field ``v_θ(xt, t; context)`` for conditional flow matching.
-
-    Inputs are concatenated: ``[xt, context, ϕ(t)]`` where ``ϕ`` is a SiLU-activated
-    linear map of multi-frequency sines and cosines of ``t`` (typical in diffusion-style
-    time conditioning). ``t`` is processed as ``(N, 1)`` after a flat batch dimension ``N``.
+    Forwards to :class:`ConditionalUNet1D` as ``(N, T, D)``. Requires ``T > 4`` so the UNet
+    downsampling path has valid length (see :meth:`CFMFuturePredictor.__init__`).
     """
 
     def __init__(
         self,
         context_dim: int,
-        pred_dim: int,
-        hidden_dim: int = 256,
-        time_dim: int = 64,
-        num_frequencies: int = 8,
-    ):
+        *,
+        seq_len: int,
+        channel_dim: int,
+        unet_base_channels: int = 64,
+        unet_channel_mults: tuple[int, ...] = (1, 2, 4),
+        unet_dropout: float = 0.0,
+    ) -> None:
         super().__init__()
+        if seq_len <= 4:
+            raise ValueError(
+                f"CFM UNet requires trajectory seq_len > 4, got seq_len={seq_len}. "
+                "Use a relabeler with a longer horizon (e.g. FutureTrajectory) or a different "
+                "future_predictor (e.g. VAE) for short horizons."
+            )
         self.context_dim = context_dim
-        self.pred_dim = pred_dim
-        self.time_dim = time_dim
-        self.num_frequencies = num_frequencies
+        self.seq_len = seq_len
+        self.channel_dim = channel_dim
 
-        fourier_dim = 2 * num_frequencies
-        self.time_proj = nn.Linear(fourier_dim, time_dim)
-        in_dim = pred_dim + context_dim + time_dim
-        self.mlp = nn.Sequential(
-            nn.Linear(in_dim, hidden_dim),
-            nn.SiLU(),
-            nn.LayerNorm(hidden_dim),
-            nn.Linear(hidden_dim, hidden_dim),
-            nn.SiLU(),
-            nn.LayerNorm(hidden_dim),
-            nn.Linear(hidden_dim, pred_dim),
+        self.backbone = ConditionalUNet1D(
+            input_dim=channel_dim,
+            output_dim=channel_dim,
+            base_channels=unet_base_channels,
+            channel_mults=unet_channel_mults,
+            cond_dim=context_dim,
+            dropout=unet_dropout,
         )
-
-    def _embed_time(self, t: torch.Tensor) -> torch.Tensor:
-        t2 = t.reshape(-1, 1)
-        f = _time_fourier_features(t2, self.num_frequencies)
-        return F.silu(self.time_proj(f))
 
     def forward(
         self,
-        xt: Float[torch.Tensor, "N pred_dim"],
+        xt: Float[torch.Tensor, "N T D"],
         context: Float[torch.Tensor, "N context_dim"],
-        t: Float[torch.Tensor, "N 1"],
-    ) -> Float[torch.Tensor, "N pred_dim"]:
-        """
-        ``(N, pred_dim)``, ``(N, context_dim)``, and ``(N, 1)``; one flow time in ``[0, 1]`` per row.
-        """
-        t_emb = self._embed_time(t)
-        h = torch.cat([xt, context, t_emb], dim=-1)
-        v = self.mlp(h)
-        return v
+        t: Float[torch.Tensor, "N 1 1"],
+    ) -> Float[torch.Tensor, "N T D"]:
+        n = xt.shape[0]
+        t_b = t.reshape(n)
+        return self.backbone(xt, cond=context, t=t_b)
 
 
 class CFMFuturePredictor(nn.Module):
     """Flow matching with **FM time**: :math:`t=0` is noise, :math:`t=1` is data. The field
     ``v_θ`` matches the constant velocity :math:`x_1 - x_0` on the straight path in
-    :meth:`compute_loss`. The wrapper flattens leading batch dims to one row per
-    :math:`(x_t, t, \text{context})`.
+    :meth:`compute_loss`. Inputs ``x_t`` use shape ``[..., T, D]`` (trajectory length ``T``,
+    per-step channel dim ``D``); leading dimensions are flattened for the vector field.
     """
+
     def __init__(
         self,
         context_dim: int,
-        pred_dim: int,
+        *,
+        trajectory_shape: torch.Size | tuple[int, ...],
+        unet_base_channels: int = 128,
+        unet_channel_mults: tuple[int, ...] = (1, 2, 4),
+        unet_dropout: float = 0.0,
     ):
         super().__init__()
+        if len(trajectory_shape) != 2:
+            raise ValueError(
+                f"trajectory_shape must be (seq_len, channel_dim), got {trajectory_shape!r}"
+            )
         self.context_dim = context_dim
-        self.pred_dim = pred_dim
+        self.trajectory_shape = torch.Size(trajectory_shape)
+        self.seq_len = int(self.trajectory_shape[0])
+        self.channel_dim = int(self.trajectory_shape[1])
 
         self.query_embedding = nn.Embedding(2, context_dim)
         self.query_embedding.weight._non_muon = True
 
-        self.v = VelocityPredictionModel(context_dim, pred_dim)
-    
+        self.v = CFMVectorField(
+            context_dim,
+            seq_len=self.seq_len,
+            channel_dim=self.channel_dim,
+            unet_base_channels=unet_base_channels,
+            unet_channel_mults=unet_channel_mults,
+            unet_dropout=unet_dropout,
+        )
+
     def wrap_DDP(self, device_ids: list[int]):
         self.query_embedding = DDP(self.query_embedding, device_ids=device_ids)
         self.v = DDP(self.v, device_ids=device_ids)
-    
+
     def state_dict(self):
         state_dict = OrderedDict()
         state_dict["query_embedding"] = maybe_unwrap(self.query_embedding).state_dict()
         state_dict["v"] = maybe_unwrap(self.v).state_dict()
         return state_dict
-    
+
     def load_state_dict(self, state_dict: OrderedDict, strict: bool = True):
         maybe_unwrap(self.query_embedding).load_state_dict(
             state_dict["query_embedding"], strict=strict
         )
         maybe_unwrap(self.v).load_state_dict(state_dict["v"], strict=strict)
-    
+
     def forward(
         self,
-        xt: Float[torch.Tensor, "... pred_dim"],
-        context: Float[torch.Tensor, "... context_dim"],
-        t: Float[torch.Tensor, "... 1"],
-    ) -> Float[torch.Tensor, "... pred_dim"]:
+        xt: Float[torch.Tensor, "... T D"],
+        context: Float[torch.Tensor, "... Dc"],
+        t: Float[torch.Tensor, "... 1 1"],
+    ) -> Float[torch.Tensor, "... T D"]:
         """
-        Arbitrary leading batch shape, then ``pred_dim`` / ``context_dim``; ``t`` has the
-        same lead shape and a final ``1`` (``… 1``). Internally flattens to apply ``.v``.
+        ``x_t`` has shape ``[..., T, D]``; ``context`` and ``t`` broadcast over the same
+        leading dimensions (``t`` ends with a singleton time-in-(0,1) axis).
         """
-        batch_shape = xt.shape[:-1]
-        N = math.prod(batch_shape) if batch_shape else 1
+        if xt.shape[-2:] != (self.seq_len, self.channel_dim):
+            raise ValueError(
+                f"xt must end with (T, D)=({self.seq_len}, {self.channel_dim}), got {tuple(xt.shape)}"
+            )
+        batch_shape = xt.shape[:-2]
+        n = math.prod(batch_shape) if batch_shape else 1
+        t_flat = t.reshape(n, 1, 1)
+        if context.shape[:-1] != xt.shape[:-2]:
+            raise ValueError(
+                f"context leading shape {tuple(context.shape[:-1])} must match xt[:-2] {tuple(xt.shape[:-2])}"
+            )
         output = self.v(
-            xt.reshape(N, self.pred_dim),
-            context=context.reshape(N, self.context_dim),
-            t=t.reshape(N, 1),
+            xt.reshape(n, self.seq_len, self.channel_dim),
+            context=context.reshape(n, self.context_dim),
+            t=t_flat,
         )
-        return output.reshape(*batch_shape, self.pred_dim)
-    
+        return output.reshape(*batch_shape, self.seq_len, self.channel_dim)
+
     @torch.inference_mode()
     def sample_prior(
         self,
@@ -154,27 +158,28 @@ class CFMFuturePredictor(nn.Module):
         :math:`v \\approx x_1 - x_0`.
 
         Returns ``(pred, None, zero_like_entropy)`` for a third slot compatible with
-        :class:`VAEFuturePredictor` call sites. ``pred`` is ``(N, pred_dim)`` if
-        ``num_samples == 1`` else ``(N, num_samples, pred_dim)``.
+        :class:`VAEFuturePredictor` call sites. ``pred`` is ``(N, T, D)`` if
+        ``num_samples == 1`` else ``(N, num_samples, T, D)`` (suitable for :meth:`FutureRelabel.process_pred`).
         """
         device = context.device
         dtype = context.dtype if context.is_floating_point() else torch.float32
-        N = context.shape[0]
+        n = context.shape[0]
+        t_sz, d_ch = self.seq_len, self.channel_dim
         ctx2 = context[:, None, :].expand(-1, num_samples, -1)
-        B = N * num_samples
-        x = torch.randn(B, self.pred_dim, device=device, dtype=dtype)
-        ctxf = ctx2.reshape(B, self.context_dim)
+        b = n * num_samples
+        x = torch.randn(b, t_sz, d_ch, device=device, dtype=dtype)
+        ctxf = ctx2.reshape(b, self.context_dim)
         dt = 1.0 / float(steps)
         for k in range(steps):
             t_mid = (k + 0.5) * dt
-            tb = x.new_full((B, 1), t_mid)
+            tb = x.new_full((b, 1, 1), t_mid)
             v = self.v(x, ctxf, tb)
             x = x + dt * v
         if num_samples == 1:
-            out = x.view(N, self.pred_dim)
+            out = x.view(n, t_sz, d_ch)
         else:
-            out = x.view(N, num_samples, self.pred_dim)
-        return out, None, out.new_zeros(N)
+            out = x.view(n, num_samples, t_sz, d_ch)
+        return out, None, out.new_zeros(n)
 
     def compute_loss(
         self,
@@ -194,18 +199,17 @@ class CFMFuturePredictor(nn.Module):
         over valid / count of valid), same layout as :meth:`VAEFuturePredictor.compute_loss`.
         """
         device = target.device
-        lead = target.shape[:-1]
         x1 = target
         x0 = torch.randn_like(x1)
-        t = torch.rand(*lead, 1, device=device, dtype=target.dtype)
+        t = torch.rand(*x1.shape[:-2], 1, 1, device=device, dtype=target.dtype)
         xt = (1.0 - t) * x0 + t * x1
 
         v_hat_proprio = self(xt, context=proprio_context, t=t)
         v_hat_extero = self(xt, context=extero_context, t=t)
         v_target = x1 - x0
 
-        lik_p = (v_hat_proprio - v_target).square().mean(dim=-1)
-        lik_e = (v_hat_extero - v_target).square().mean(dim=-1)
+        lik_p = (v_hat_proprio - v_target).square().mean(dim=(-1, -2))
+        lik_e = (v_hat_extero - v_target).square().mean(dim=(-1, -2))
         per = lik_p + lik_e
 
         if valid_mask is not None:
@@ -226,4 +230,3 @@ class CFMFuturePredictor(nn.Module):
             "future/loss_proprio": loss_proprio_m,
             "future/loss_extero": loss_extero_m,
         }
-

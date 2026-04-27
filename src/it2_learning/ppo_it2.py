@@ -78,11 +78,21 @@ class FuturePredictorConfig:
 
 
 @dataclass
+class FutureTargetEncoderConfig:
+    base_channels: int = 32
+    channel_mults: Tuple[int, ...] = (1, 2)
+    output_dim: int = 128
+
+
+@dataclass
 class VAEFuturePredictorConfig(FuturePredictorConfig):
     predictor: str = "VAE"
-    relabeler: str = "FutureState"
+    # relabeler: str = "FutureState"
+    relabeler: str = "FutureTrajectory"
     relabel_mode: str = "state7"
-    latent_dim: int = 16
+    decimation: int = 2
+    latent_dim: int = 32
+    encoder: FutureTargetEncoderConfig = field(default_factory=FutureTargetEncoderConfig)
     kl_coef: float = 0.02
     prior_kl_coef: float = 0.5
 
@@ -230,11 +240,15 @@ class PPOPolicy(TensorDictModuleBase):
         self.relabeler.to(self.device)
 
         if self.cfg.future_predictor.predictor == "VAE":
+            fp: VAEFuturePredictorConfig = self.cfg.future_predictor
             self.future_predictor = VAEFuturePredictor(
                 context_dim=self.fusion_encoder.output_dim,
                 target_shape=self.relabeler.target_shape,
-                latent_dim=self.cfg.future_predictor.latent_dim,
-                kl_coef=self.cfg.future_predictor.kl_coef,
+                latent_dim=fp.latent_dim,
+                kl_coef=fp.kl_coef,
+                encoder_base_channels=fp.encoder.base_channels,
+                encoder_channel_mults=fp.encoder.channel_mults,
+                encoder_output_dim=fp.encoder.output_dim,
             ).to(self.device)
         elif self.cfg.future_predictor.predictor == "CFM":
             fp: CFMFuturePredictorConfig = self.cfg.future_predictor

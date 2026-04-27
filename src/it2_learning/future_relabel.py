@@ -20,6 +20,7 @@ from __future__ import annotations
 
 from abc import ABC, abstractmethod
 import torch
+import torch.nn as nn
 from jaxtyping import Float
 from tensordict import TensorDict
 from active_adaptation.utils.math import (
@@ -29,6 +30,7 @@ from active_adaptation.utils.math import (
     euler_from_quat,
     wrap_to_pi,
 )
+from active_adaptation.learning.modules import VecNorm
 
 # Mode name -> target dimension (last axis). Keep in sync with `compute_future_target`.
 FUTURE_LABEL_MODES: dict[str, tuple[int, tuple[str, ...]]] = {
@@ -37,23 +39,28 @@ FUTURE_LABEL_MODES: dict[str, tuple[int, tuple[str, ...]]] = {
 }
 
 
-class FutureRelabel(ABC):
+class FutureRelabel(nn.Module, ABC):
     """Build ``_future_target`` and ``_future_valid`` from ``root_state_w`` (and friends)."""
 
     mode: str
     horizon: int
     dim: int
     keys: tuple[str, ...]
+    vecnorm: VecNorm
 
     @abstractmethod
-    def relabel(self, tensordict: TensorDict) -> TensorDict:
+    def relabel(self, tensordict: TensorDict, normalize: bool = True) -> TensorDict:
         """Return a sliced tensordict with ``_future_target`` and ``_future_valid``."""
         ...
+
+    def denormalize(self, input_vector: torch.Tensor):
+        return self.vecnorm.denormalize(input_vector)
 
 
 class FutureState(FutureRelabel):
 
     def __init__(self, mode: str, horizon: int) -> None:
+        super().__init__()
         self.mode = mode
         self.horizon = horizon
         if self.mode not in FUTURE_LABEL_MODES:
@@ -62,8 +69,9 @@ class FutureState(FutureRelabel):
                 f"Expected one of {list(FUTURE_LABEL_MODES)}"
             )
         self.dim, self.keys = FUTURE_LABEL_MODES[self.mode]
+        self.vecnorm = VecNorm(self.dim, decay=1.0)
 
-    def relabel(self, tensordict: TensorDict) -> TensorDict:
+    def relabel(self, tensordict: TensorDict, normalize: bool = True) -> TensorDict:
         """Slice to ``t_out = T - H + 1`` and add ``_future_target`` / ``_future_valid``.
 
         The future label is the root state at time ``t + H`` (after **H** forward steps
@@ -96,15 +104,19 @@ class FutureState(FutureRelabel):
             future_targets.append(future_target)
             valid = tensordict["episode_id"][:, t] == tensordict["episode_id"][:, t + H]
             valid_masks.append(valid)
-        result["_future_target"] = torch.stack(future_targets, dim=1).reshape(
-            N, t_out, self.dim
-        )
+        future_targets = torch.stack(future_targets, dim=1).reshape(N, t_out, self.dim)
+        self.vecnorm._update(future_targets)
+        if normalize:
+            future_targets = self.vecnorm._normalize(future_targets)
+        result["_future_target"] = future_targets
         result["_future_valid"] = torch.stack(valid_masks, dim=1)
         return result
 
 
 class FutureTrajectory(FutureRelabel):
+
     def __init__(self, mode: str, horizon: int) -> None:
+        super().__init__()
         self.mode = mode
         self.horizon = horizon
         if self.mode not in FUTURE_LABEL_MODES:
@@ -114,8 +126,9 @@ class FutureTrajectory(FutureRelabel):
             )
         self.dim, self.keys = FUTURE_LABEL_MODES[self.mode]
         self.dim = self.dim * self.horizon
+        self.vecnorm = VecNorm(self.dim, decay=1.0)
 
-    def relabel(self, tensordict: TensorDict) -> TensorDict:
+    def relabel(self, tensordict: TensorDict, normalize: bool = True) -> TensorDict:
         """Slice to ``t_out = T - H + 1`` and add ``_future_target`` / ``_future_valid``.
 
         The target stacks relative kinematics for each time in ``[t, t + H)``, then flattens
@@ -150,9 +163,11 @@ class FutureTrajectory(FutureRelabel):
             )
             valid_masks.append(valid)
         # (N, t_out, H, self.dim) -> flatten trajectory per time for a fixed H * self.dim head
-        result["_future_target"] = torch.stack(future_targets, dim=1).reshape(
-            N, t_out, self.dim
-        )
+        future_targets = torch.stack(future_targets, dim=1).reshape(N, t_out, self.dim)
+        self.vecnorm._update(future_targets)
+        if normalize:
+            future_targets = self.vecnorm._normalize(future_targets)
+        result["_future_target"] = future_targets
         result["_future_valid"] = torch.stack(valid_masks, dim=1)
         return result
 

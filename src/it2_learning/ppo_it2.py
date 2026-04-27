@@ -218,6 +218,7 @@ class PPOPolicy(TensorDictModuleBase):
             mode=self.cfg.future_predictor.relabel_mode,
             horizon=self.cfg.train_every,
         )
+        self.relabeler.to(self.device)
 
         if self.cfg.future_predictor.predictor == "VAE":
             self.future_predictor = VAEFuturePredictor(

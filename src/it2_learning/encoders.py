@@ -11,38 +11,17 @@ ExteroEncoderKind = Literal["cnn", "defm_cnn"]
 DefmCnnVariant = Literal["defm_resnet18", "defm_regnet_y_400mf"]
 
 
-def _make_cnn_norm(
-    channels: int,
-    norm: Literal["none", "group"],
-    groups: int,
-) -> nn.Module:
-    if norm == "none":
-        return nn.Identity()
-    if norm != "group":
-        raise ValueError(f"Unsupported cnn_norm={norm!r}, expected 'none' or 'group'.")
-
-    group_count = min(groups, channels)
-    while channels % group_count != 0 and group_count > 1:
-        group_count -= 1
-    return nn.GroupNorm(group_count, channels)
-
-
 def simple_extero_encoder(
     extero_channels: int,
     token_dim: int,
     activation: Type[nn.Module],
-    cnn_norm: Literal["none", "group"],
-    cnn_norm_groups: int,
 ) -> nn.Sequential:
     return nn.Sequential(
         nn.Conv2d(extero_channels, 32, kernel_size=3, stride=2, padding=1),
-        _make_cnn_norm(32, cnn_norm, cnn_norm_groups),
         activation(),
         nn.Conv2d(32, 64, kernel_size=3, stride=2, padding=1),
-        _make_cnn_norm(64, cnn_norm, cnn_norm_groups),
         activation(),
         nn.Conv2d(64, token_dim, kernel_size=3, stride=2, padding=1),
-        _make_cnn_norm(token_dim, cnn_norm, cnn_norm_groups),
         activation(),
         nn.AdaptiveAvgPool2d(1),
         nn.Flatten(start_dim=1),
@@ -112,16 +91,12 @@ def build_extero_encoder(
     defm_pretrained: bool,
     token_dim: int,
     activation: Type[nn.Module],
-    cnn_norm: Literal["none", "group"],
-    cnn_norm_groups: int,
 ) -> nn.Module:
     if extero_encoder == "cnn":
         return simple_extero_encoder(
             extero_channels,
             token_dim,
             activation,
-            cnn_norm,
-            cnn_norm_groups,
         )
     if extero_encoder == "defm_cnn":
         return ExteroDefmCnn(
@@ -150,8 +125,6 @@ class EncoderOne(nn.Module):
         hidden_dim: int = 256,
         num_heads: int = 4,
         activation: Type[nn.Module] = nn.SiLU,
-        cnn_norm: Literal["none", "group"] = "none",
-        cnn_norm_groups: int = 8,
         extero_encoder: ExteroEncoderKind = "cnn",
         defm_variant: DefmCnnVariant = "defm_resnet18",
         defm_pretrained: bool = True,
@@ -169,9 +142,10 @@ class EncoderOne(nn.Module):
             defm_pretrained=defm_pretrained,
             token_dim=token_dim,
             activation=activation,
-            cnn_norm=cnn_norm,
-            cnn_norm_groups=cnn_norm_groups,
         )
+        self.query_ln = nn.LayerNorm(token_dim)
+        self.proprio_ln = nn.LayerNorm(token_dim)
+        self.extero_ln = nn.LayerNorm(token_dim)
         self.modality_embedding = nn.Parameter(torch.randn(3, token_dim) * 0.02)
         self.modality_embedding._non_muon = True
         
@@ -206,9 +180,9 @@ class EncoderOne(nn.Module):
         proprio_flat = proprio_inp.reshape(-1, proprio_inp.shape[-1])
         extero_flat = extero_inp.reshape(-1, *extero_inp.shape[-3:])
 
-        query_feature = query_flat
-        proprio_feature = self.proprio_mlp(proprio_flat)
-        extero_feature = self.extero_mlp(extero_flat)
+        query_feature = self.query_ln(query_flat)
+        proprio_feature = self.proprio_ln(self.proprio_mlp(proprio_flat))
+        extero_feature = self.extero_ln(self.extero_mlp(extero_flat))
 
         tokens = torch.stack(
             [query_feature, proprio_feature, extero_feature], dim=1
@@ -251,8 +225,6 @@ class EncoderTwo(nn.Module):
         token_dim: int = 256,
         num_heads: int = 4,
         activation: Type[nn.Module] = nn.SiLU,
-        cnn_norm: Literal["none", "group"] = "none",
-        cnn_norm_groups: int = 8,
         extero_encoder: ExteroEncoderKind = "cnn",
         defm_variant: DefmCnnVariant = "defm_resnet18",
         defm_pretrained: bool = True,
@@ -269,9 +241,10 @@ class EncoderTwo(nn.Module):
             defm_pretrained=defm_pretrained,
             token_dim=token_dim,
             activation=activation,
-            cnn_norm=cnn_norm,
-            cnn_norm_groups=cnn_norm_groups,
         )
+        self.query_ln = nn.LayerNorm(token_dim)
+        self.proprio_ln = nn.LayerNorm(token_dim)
+        self.extero_ln = nn.LayerNorm(token_dim)
 
         self.self_attn = nn.MultiheadAttention(
             embed_dim=token_dim,
@@ -295,6 +268,17 @@ class EncoderTwo(nn.Module):
 
         self.output_dim = token_dim
 
+        def init_(module: nn.MultiheadAttention):
+            nn.init.xavier_uniform_(module.in_proj_weight)
+            if module.in_proj_bias is not None:
+                nn.init.constant_(module.in_proj_bias, 0.)
+            nn.init.orthogonal_(module.out_proj.weight, 0.02)
+            if module.out_proj.bias is not None:
+                nn.init.constant_(module.out_proj.bias, 0.)
+
+        init_(self.self_attn)
+        init_(self.cross_attn)
+
     def forward(
         self,
         queries_inp: Float[torch.Tensor, "... M token_dim"],
@@ -311,8 +295,9 @@ class EncoderTwo(nn.Module):
         proprio_flat = proprio_inp.reshape(N, proprio_inp.shape[-1])
         extero_flat = extero_inp.reshape(N, *extero_inp.shape[-3:])
 
-        proprio_feature = self.proprio_mlp(proprio_flat).reshape(N, 1, self.token_dim)
-        extero_feature = self.extero_mlp(extero_flat).reshape(N, 1, self.token_dim)
+        queries = self.query_ln(queries)
+        proprio_feature = self.proprio_ln(self.proprio_mlp(proprio_flat)).reshape(N, 1, self.token_dim)
+        extero_feature = self.extero_ln(self.extero_mlp(extero_flat)).reshape(N, 1, self.token_dim)
 
         tokens = torch.cat(
             [queries, proprio_feature, extero_feature], dim=1

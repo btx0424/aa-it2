@@ -126,8 +126,6 @@ class PPOConfig:
     use_amp: bool = False
 
     in_keys: Tuple[str, ...] = (CMD_KEY, OBS_KEY, "extero", "root_state_w")
-    cnn_norm: str = "none"
-    cnn_norm_groups: int = 8
     # Extero: "cnn" = small built-in conv stack; "defm_cnn" = DeFM ResNet/RegNet + BiFPN backbone.
     extero_encoder: str = "cnn" # or "defm_cnn"
     defm_variant: str = "defm_resnet18"  # or "defm_regnet_y_400mf"
@@ -210,8 +208,6 @@ class PPOPolicy(TensorDictModuleBase):
             proprio_shape,
             extero_shape,
             token_dim=self.token_dim,
-            cnn_norm=self.cfg.cnn_norm,
-            cnn_norm_groups=self.cfg.cnn_norm_groups,
             extero_encoder=self.cfg.extero_encoder,
             defm_variant=self.cfg.defm_variant,
             defm_pretrained=self.cfg.defm_pretrained,
@@ -276,7 +272,7 @@ class PPOPolicy(TensorDictModuleBase):
         
         def init_(module):
             if getattr(module, "_defm_no_reinit", False):
-                return
+                return                
             if isinstance(module, nn.Linear):
                 nn.init.orthogonal_(module.weight, 0.02)
                 nn.init.constant_(module.bias, 0.)

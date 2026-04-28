@@ -125,6 +125,15 @@ class PPOConfig:
     use_ddp: bool = True
     use_amp: bool = False
 
+    value_loss_coef: float = 0.5
+    # EMA momentum for the return std used to normalize the value loss.
+    # Updated once per rollout from full-batch returns; all minibatch steps within
+    # that rollout use the same frozen value (analogous to VecNorm freeze).
+    ret_std_ema_momentum: float = 0.99
+    # LR multiplier for the encoder and cmd_encoder relative to actor/critic.
+    # The encoder is a deeper shared network and benefits from a more conservative update.
+    encoder_lr_scale: float = 0.5
+
     in_keys: Tuple[str, ...] = (CMD_KEY, OBS_KEY, "extero", "root_state_w")
     # Extero: "cnn" = small built-in conv stack; "defm_cnn" = DeFM ResNet/RegNet + BiFPN backbone.
     extero_encoder: str = "cnn" # or "defm_cnn"
@@ -167,7 +176,7 @@ class PPOPolicy(TensorDictModuleBase):
         self.device = torch.device(device)
 
         self.entropy_coef = self.cfg.entropy_coef
-        self.max_grad_norm = 1.0
+        self.max_grad_norm = 2.0
         self.token_dim = self.cfg.token_dim
         self.clip_param = self.cfg.clip_param
         self.critic_loss_fn = nn.MSELoss(reduction="none")
@@ -299,6 +308,10 @@ class PPOPolicy(TensorDictModuleBase):
         #     # self.update = CudaGraphModule(self.update)
         self.prev_tensordict = None
         self._future_enabled = False
+        # Running EMA of return std for scale-invariant value loss normalization.
+        # Initialized conservatively at 1.0 so early training uses a larger (not smaller)
+        # value gradient — the EMA ramps up to the true scale within the first few rollouts.
+        self._ret_std_ema: float = 1.0
 
     def run_policy(
         self,
@@ -371,7 +384,9 @@ class PPOPolicy(TensorDictModuleBase):
         self.world_size = aa.get_world_size()
     
     def _configure_optimizers(self):
+        encoder_lr = self.cfg.lr * self.cfg.encoder_lr_scale
         if self.cfg.muon:
+            # MuonAdamWWrapper does not support per-group LR; encoder_lr_scale has no effect here.
             self.opt = MuonAdamWWrapper(
                 [self.fusion_encoder, self.cmd_encoders["primary"], self.actor, self.critic],
                 lr=self.cfg.lr,
@@ -380,8 +395,10 @@ class PPOPolicy(TensorDictModuleBase):
         else:
             self.opt = torch.optim.AdamW(
                 [
-                    {"params": self.fusion_encoder.parameters()},
-                    {"params": self.cmd_encoders["primary"].parameters()},
+                    # param groups 0-1: encoder (lower LR — deeper shared network)
+                    {"params": self.fusion_encoder.parameters(), "lr": encoder_lr},
+                    {"params": self.cmd_encoders["primary"].parameters(), "lr": encoder_lr},
+                    # param groups 2-3: actor / critic heads
                     {"params": self.actor.parameters()},
                     {"params": self.critic.parameters()},
                 ],
@@ -539,6 +556,19 @@ class PPOPolicy(TensorDictModuleBase):
         infos = []
         with ScopedTimer("compute_advantage"):
             self._compute_advantage(tensordict, "adv", "ret")
+
+        # Update EMA of return std from the full rollout before the PPO epoch loop,
+        # so every minibatch update for this rollout uses the same normalization factor.
+        # In distributed training, synchronize the local ret_std across ranks first so
+        # all ranks update their EMA with the same global value — matching the scale of
+        # gradients that DDP will average.
+        ret_std_t = tensordict["ret"].std()
+        if aa.is_distributed():
+            distr.all_reduce(ret_std_t, op=distr.ReduceOp.SUM)
+            ret_std_t = ret_std_t / aa.get_world_size()
+        m = self.cfg.ret_std_ema_momentum
+        self._ret_std_ema = m * self._ret_std_ema + (1.0 - m) * ret_std_t.item()
+
         action = tensordict[ACTION_KEY]
         adv_unnormalized = tensordict["adv"].clone()
         log_probs_before = tensordict["action_log_prob"]
@@ -568,12 +598,14 @@ class PPOPolicy(TensorDictModuleBase):
         infos = pytree.tree_map(lambda *xs: sum(xs).item() / len(xs), *infos)
         infos["curriculum/std_chaser"] = std0.mean().item()
         infos["curriculum/std_evader"] = std1.mean().item()
-        infos["actor/lr"] = self.opt.param_groups[0]["lr"]
+        infos["actor/lr"] = self.opt.param_groups[-1]["lr"]  # actor/critic groups are last
+        infos["encoder/lr"] = self.opt.param_groups[0]["lr"]
         infos["actor/policy_gain"] = policy_gain.mean().item()
         infos["actor/weighted_ratio"] = weighted_ratio.mean().item()
 
         infos["critic/value_mean"] = tensordict["ret"].mean().item()
         infos["critic/value_var"] = tensordict["ret"].var().item()
+        infos["critic/ret_std_ema"] = self._ret_std_ema
         infos["critic/neg_rew_ratio"] = (tensordict[REWARD_KEY].sum(-1) <= 0.).float().mean().item()
         if aa.is_distributed():
             self.cmd_norm.synchronize(mode="broadcast")
@@ -654,8 +686,14 @@ class PPOPolicy(TensorDictModuleBase):
             entropy_loss = - self.entropy_coef * entropy
 
             values = tensordict["state_value"]
-            value_loss = self.critic_loss_fn(values, value_targets)
-            value_loss = (value_loss.reshape_as(valid) * valid).sum() / valid_cnt
+            value_loss_raw = self.critic_loss_fn(values, value_targets)
+            value_loss_raw = (value_loss_raw.reshape_as(valid) * valid).sum() / valid_cnt
+            # Scale-invariant value loss: divide by the EMA of return std^2 so the encoder
+            # gradient stays bounded as cumulative returns grow over training.
+            # The EMA was updated once for this rollout (in train_policy) and is shared
+            # across all minibatch steps — consistent normalization within the PPO epoch loop.
+            ret_std_ema = max(self._ret_std_ema, 1.0)
+            value_loss = self.cfg.value_loss_coef * value_loss_raw / ret_std_ema ** 2
 
             loss = policy_loss + entropy_loss + value_loss
 
@@ -673,6 +711,7 @@ class PPOPolicy(TensorDictModuleBase):
             allreduce_grads(self.critic.parameters())
 
         encoder_grad_norm = nn.utils.clip_grad_norm_(self.fusion_encoder.parameters(), self.max_grad_norm)
+        cmd_encoder_grad_norm = nn.utils.clip_grad_norm_(self.cmd_encoders["primary"].parameters(), self.max_grad_norm)
         actor_grad_norm = nn.utils.clip_grad_norm_(self.actor.parameters(), self.max_grad_norm)
         critic_grad_norm = nn.utils.clip_grad_norm_(self.critic.parameters(), self.max_grad_norm)
 
@@ -683,19 +722,20 @@ class PPOPolicy(TensorDictModuleBase):
             self.opt.step()
         
         with torch.no_grad():
-            explained_var = 1 - value_loss / value_targets[valid].var()
+            explained_var = 1 - value_loss_raw / value_targets[valid].var()
             clipfrac = ((ratio - 1.0).abs() > self.clip_param).float().mean()
             approx_kl = ((ratio - 1.0) - log_ratio).mean()
             symmetry_loss = F.mse_loss(dist.mean[bsize//2:], self.act_transform(dist.mean[:bsize//2]))
         return {
             "encoder/grad_norm": encoder_grad_norm,
+            "encoder/cmd_grad_norm": cmd_encoder_grad_norm,
             "actor/policy_loss": policy_loss.detach(),
             "actor/entropy": entropy.detach(),
             "actor/grad_norm": actor_grad_norm,
             "actor/clamp_ratio": clipfrac,
             "actor/approx_kl": approx_kl,
             "actor/symmetry_loss": symmetry_loss.detach(),
-            "critic/value_loss": value_loss.detach(),
+            "critic/value_loss": value_loss_raw.detach(),
             "critic/grad_norm": critic_grad_norm,
             "critic/explained_var": explained_var,
         }
@@ -713,6 +753,7 @@ class PPOPolicy(TensorDictModuleBase):
                 module = module.module
             state_dict[name] = module.state_dict()
         state_dict["cfg"] = asdict(self.cfg)
+        state_dict["_ret_std_ema"] = self._ret_std_ema
         return state_dict
     
     def load_state_dict(self, state_dict, strict=True):
@@ -738,6 +779,8 @@ class PPOPolicy(TensorDictModuleBase):
         print(f"Successfully loaded {succeed_keys}.")
         if "cfg" in state_dict:
             self.prev_cfg = PPOConfig(**state_dict["cfg"])
+        if "_ret_std_ema" in state_dict:
+            self._ret_std_ema = state_dict["_ret_std_ema"]
         return failed_keys
 
 

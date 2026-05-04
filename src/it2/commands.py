@@ -15,10 +15,22 @@ from active_adaptation.utils.symmetry import SymmetryTransform
 class Game(Command):
     """
     A two-agent chaser-evader game for robots to learn locomotion skills.
+
+    If ``secondary_command`` is True, after one completed episode the env may switch to
+    ``command_mode=1``: the policy sees a playback target from ``recorded_root_state_w`` and
+    is respawned at ``replay_start_root_state_w`` (the same world root pose used when that
+    clip was first recorded under the primary command). Primary episodes still run first to
+    fill the recording buffer.
     """
-    def __init__(self, env, catch_radius: float = 0.8) -> None:
+    def __init__(
+        self,
+        env,
+        catch_radius: float = 0.8,
+        secondary_command: bool = False,
+    ) -> None:
         super().__init__(env)
         self.catch_radius = catch_radius
+        self.secondary_command = secondary_command
 
         from active_adaptation.envs.terrain import BetterTerrainImporter, BetterTerrainGenerator
         from active_adaptation.envs.backends.isaac import IsaacSceneAdapter
@@ -62,6 +74,15 @@ class Game(Command):
             self.init_angle_range[is_corridor, 0] = 0.0
             self.init_angle_range[is_corridor, 1] = 0.0
 
+            # switch between primary and secondary command
+            self.command_mode = torch.zeros(self.num_envs, 1, dtype=torch.long)
+            L = self.env.max_episode_length[0].item()
+            self.recorded_root_state_w = torch.zeros(self.num_envs, L, 13)
+            self.recorded_length = torch.zeros(self.num_envs, 1, dtype=torch.long)
+            # World root state (13) used to begin the last *primary* episode; secondary
+            # respawns here so replay t=0 matches the recorded clip.
+            self.replay_start_root_state_w = torch.zeros(self.num_envs, 13)
+
         if self.env.sim.has_gui() and self.env.backend == "isaac":
             self.marker = self.scene.create_arrow_marker(
                 prim_path="/Visuals/Command/arrow",
@@ -80,59 +101,127 @@ class Game(Command):
             )
         self.update()
 
-    @property
-    def command(self):
-        arange = torch.arange(self.num_envs, device=self.device)
-        quat = self.asset.data.root_link_quat_w
-        return torch.cat(
-            [
-                quat_rotate_inverse(quat, self.target_diff),
-                quat_rotate_inverse(quat, self.target_lin_vel_w),
-                (arange % 2 == 0).reshape(self.num_envs, 1),
-                (arange % 2 == 1).reshape(self.num_envs, 1),
-            ],
-            dim=-1,
-        )
+    def command(self, key: str = "primary"):
+        if key == "primary":
+            arange = torch.arange(self.num_envs, device=self.device)
+            quat = self.asset.data.root_link_quat_w
+            return torch.cat(
+                [
+                    quat_rotate_inverse(quat, self.target_diff),
+                    quat_rotate_inverse(quat, self.target_lin_vel_w),
+                    (arange % 2 == 0).reshape(self.num_envs, 1),
+                    (arange % 2 == 1).reshape(self.num_envs, 1),
+                ],
+                dim=-1,
+            )
+        elif key == "secondary":
+            n = torch.arange(self.num_envs, device=self.device)
+            L = self.recorded_root_state_w.shape[1]
+            t = self.env.episode_length_buf.reshape(self.num_envs).long().clamp(0, L - 1)
+            # convert vel_xy to body frame
+            root_state_w = self.recorded_root_state_w[n, t]
+            root_pos_w = root_state_w[:, :3]
+            root_quat_w = root_state_w[:, 3:7]
+            root_lin_vel_w = root_state_w[:, 7:10]
+            root_ang_vel_w = root_state_w[:, 10:13]
+            root_pos_b = quat_rotate_inverse(root_quat_w, root_pos_w - self.asset.data.root_link_pos_w)
+            root_lin_vel_b = quat_rotate_inverse(root_quat_w, root_lin_vel_w)
+            root_ang_vel_b = quat_rotate_inverse(root_quat_w, root_ang_vel_w)
+            return torch.cat(
+                [
+                    root_pos_b[:, :2], # only xy
+                    root_lin_vel_b[:, :2], # only xy
+                    root_ang_vel_b[:, 2:3], # only yaw
+                ],
+                dim=-1,
+            )
+        elif key == "mode":
+            return self.command_mode.reshape(self.num_envs, 1)
+        else:
+            raise ValueError(f"Invalid key: {key}")
 
-    @property
-    def command_mode(self):
-        return self.role.reshape(self.num_envs, 1)
-
-    def symmetry_transform(self):
-        return SymmetryTransform(
-            perm=torch.arange(8), signs=torch.tensor([1, -1, 1, 1, -1, 1, 1, 1])
-        )
+    def symmetry_transform(self, key: str = "primary"):
+        # the general rule is to flip y, roll, and yaw components (if present)
+        if key == "primary":
+            return SymmetryTransform(
+                perm=torch.arange(8),
+                signs=torch.tensor([1, -1, 1, 1, -1, 1, 1, 1])
+            )
+        elif key == "secondary":
+            return SymmetryTransform(
+                perm=torch.arange(2 + 2 + 1), # pos_xy + vel_xy + yaw_rate
+                signs=torch.tensor([1, -1, 1, -1, -1])
+            )
+        else:
+            raise ValueError(f"Invalid key: {key}")
 
     def sample_init(self, env_ids: torch.Tensor) -> torch.Tensor:
         self.env.extra["curriculum/distance_traveled"] = self.distance_traveled.mean()
         self.distance_traveled[env_ids] = 0.0
 
-        num_envs = len(env_ids)
-        chase = env_ids % 2 == 0
-        init_root_state = self.init_root_state[env_ids]
-        
-        origin_indices = torch.randint(
-            0, len(self.origins), (num_envs,), device=self.device
+        num_r = env_ids.shape[0]
+        init_root_state = self.init_root_state[env_ids].clone()
+
+        # Per-env: secondary mode only after at least one completed episode (buffer filled).
+        if self.secondary_command:
+            has_recording = (self.recorded_length[env_ids].squeeze(-1) > 0)
+            self.command_mode[env_ids] = has_recording.long().unsqueeze(-1)
+        else:
+            has_recording = torch.zeros(num_r, dtype=torch.bool, device=self.device)
+            self.command_mode[env_ids] = 0
+
+        prim = ~has_recording if self.secondary_command else torch.ones(
+            num_r, dtype=torch.bool, device=self.device
         )
-        origins = self.origins[origin_indices]
 
-        init_pos = origins[chase]
-        angle_start, angle_end = self.init_angle_range[origin_indices[chase]].unbind(1)
+        if prim.any():
+            pids = env_ids[prim]
+            np_ = pids.shape[0]
+            chase = pids % 2 == 0
+            init_p = self.init_root_state[pids].clone()
+            origin_indices = torch.randint(
+                0, len(self.origins), (np_,), device=self.device
+            )
+            origins = self.origins[origin_indices]
 
-        angle = torch.rand(len(init_pos), device=self.device) * (angle_end - angle_start) + angle_start
-        radius = (torch.rand(len(init_pos), device=self.device) + 0.8).unsqueeze(1)
-        offset = torch.stack([torch.cos(angle), torch.sin(angle), torch.zeros_like(angle)], dim=-1) * radius
-        init_root_state[chase, :3] += init_pos + offset
-        init_root_state[~chase, :3] += init_pos - offset
-        quat = sample_quat_yaw(num_envs, device=self.device)
-        init_root_state[:, 3:7] = quat
+            init_pos = origins[chase]
+            angle_start, angle_end = self.init_angle_range[origin_indices[chase]].unbind(1)
+
+            angle = (
+                torch.rand(init_pos.shape[0], device=self.device)
+                * (angle_end - angle_start)
+                + angle_start
+            )
+            radius = (torch.rand(init_pos.shape[0], device=self.device) + 0.8).unsqueeze(1)
+            offset = (
+                torch.stack([torch.cos(angle), torch.sin(angle), torch.zeros_like(angle)], dim=-1)
+                * radius
+            )
+            init_p[chase, :3] += init_pos + offset
+            init_p[~chase, :3] += init_pos - offset
+            init_p[:, 3:7] = sample_quat_yaw(np_, device=self.device)
+            init_root_state[prim] = init_p
+            if self.secondary_command:
+                self.replay_start_root_state_w[pids] = init_p.clone()
+
+        # Replay episode: spawn at the same world root pose as the recorded clip's start.
+        if self.secondary_command and has_recording.any():
+            sec = has_recording
+            sids = env_ids[sec]
+            init_root_state[sec] = self.replay_start_root_state_w[sids].clone()
+
         return init_root_state
 
     def reset(self, env_ids: torch.Tensor):
         self.target_caught_time[env_ids] = 0.0
-        return super().reset(env_ids)
 
     def update(self):
+        L = self.recorded_root_state_w.shape[1]
+        n = torch.arange(self.num_envs, device=self.device)
+        t = self.env.episode_length_buf.long().clamp(0, L - 1)
+        self.recorded_root_state_w[n, t] = self.asset.data.root_link_state_w
+        self.recorded_length = self.env.episode_length_buf.clone()
+
         self.target_pos_w = torch.stack(
             [
                 self.asset.data.root_pos_w[1::2],

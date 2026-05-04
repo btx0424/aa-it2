@@ -44,8 +44,12 @@ command:
   catch_radius: 0.8
 
 observation:
-  command:
+  primary_command:
     command:  {}
+  secondary_command:
+    command:  {key: secondary}
+  command_mode:
+    command:  {key: mode}
   policy:
     gravity_multistep: {steps: 4, noise_std: 0.05}
     joint_pos_multistep: {steps: 4, noise_std: 0.05}

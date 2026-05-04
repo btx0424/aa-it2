@@ -35,6 +35,7 @@ from active_adaptation.learning.modules import VecNorm
 # Mode name -> target dimension (last axis). Keep in sync with `compute_future_target`.
 FUTURE_LABEL_MODES: dict[str, tuple[int, tuple[str, ...]]] = {
     "state7": (7, ("rel_pos", "rel_yaw", "rel_linvel")),
+    # "state4_contact": 
     "state10": (10, ("rel_pos", "rel_yaw", "rel_linvel", "rel_angvel")),
 }
 
@@ -57,23 +58,31 @@ class FutureRelabel(nn.Module, ABC):
         return self.vecnorm.denormalize(input_vector)
 
 
-class TwistCommand(FutureRelabel):
+class LocomotionCommand(FutureRelabel):
     """Relabel the next state's xy-velocity and yaw velocity as the command for the current step.
     """
     def __init__(self):
         super().__init__()
-        self.target_shape = torch.Size((3,))
+        self.target_shape = torch.Size((2 + 2 + 1,))
         self.vecnorm = VecNorm(self.target_shape, decay=1.0)
     
     def relabel(self, tensordict: TensorDict, normalize: bool = True) -> TensorDict:
+        state = tensordict["root_state_w"]
+        root_pos_w = state[..., :3]
+        quat_w = state[..., 3:7]
         next_state = tensordict["next", "root_state_w"]
-        next_quat_w = next_state[..., 3:7]
+        next_pos_w = next_state[..., :3]
         next_lin_vel_w = next_state[..., 7:10]
         next_ang_vel_w = next_state[..., 10:13]
-        next_lin_vel_b = quat_rotate_inverse(next_quat_w, next_lin_vel_w)
-        next_ang_vel_b = quat_rotate_inverse(next_quat_w, next_ang_vel_w)
+        next_pos_b = quat_rotate_inverse(quat_w, next_pos_w - root_pos_w)
+        next_lin_vel_b = quat_rotate_inverse(quat_w, next_lin_vel_w)
+        next_ang_vel_b = quat_rotate_inverse(quat_w, next_ang_vel_w)
         future_target = torch.cat(
-            [next_lin_vel_b[..., :2], next_ang_vel_b[..., 2:3]],
+            [
+                next_pos_b[..., :2],
+                next_lin_vel_b[..., :2],
+                next_ang_vel_b[..., 2:3]
+            ],
             dim=-1,
         )
         self.vecnorm._update(future_target)
@@ -202,6 +211,86 @@ class FutureTrajectory(FutureRelabel):
         if normalize:
             future_targets = self.vecnorm._normalize(future_targets)
         result["_future_target"] = future_targets # (N, t_out, H // decimation, state_dim)
+        result["_future_valid"] = torch.stack(valid_masks, dim=1)
+        return result
+
+
+class NextContactPos(FutureRelabel):
+    """Stack **last** contact link positions over the next :math:`H` steps in the root frame at *t*.
+
+    Uses the ``last_contact_pos`` observation (world frame, ``3 × num_feet`` per step).
+    For each rollout time *t*, the target has shape ``(H, num_feet × 3)``: at row ``k``,
+    ``last_contact_pos[t + k]`` is expressed in the body frame of ``root_state_w[t]`` (same
+    ``rel_pos`` convention as :func:`relative_kinematics`). Rows are ``k = 0, …, H - 1``,
+    matching :class:`FutureTrajectory`'s time window ``[t, t + H)``.
+
+    ``_future_valid`` is true when ``episode_id[t] == episode_id[t + H - 1]`` (whole window
+    lies in one episode).
+
+    Args:
+        horizon: Window length ``H`` (typically ``train_every``).
+        num_feet: Number of contact bodies (default 4 for quadrupeds).
+        obs_key: TensorDict key for the observation group (default ``"last_contact_pos"``).
+    """
+
+    def __init__(
+        self,
+        horizon: int,
+        num_feet: int = 4,
+        obs_key: str = "last_contact_pos",
+    ) -> None:
+        super().__init__()
+        self.horizon = horizon
+        self.num_feet = num_feet
+        self.obs_key = obs_key
+        self.dim = num_feet * 3
+        self.target_shape = torch.Size((horizon, self.dim))
+        self.vecnorm = VecNorm(self.target_shape, decay=1.0)
+
+    def relabel(self, tensordict: TensorDict, normalize: bool = True) -> TensorDict:
+        N, T = tensordict.shape[:2]
+        H = self.horizon
+        t_out = T - H + 1
+        if t_out < 1:
+            raise ValueError(
+                f"T - H + 1 = {t_out} < 1: need more time steps than the horizon (T={T}, H={H})"
+            )
+        if self.obs_key not in tensordict.keys():
+            raise KeyError(
+                f"NextContactPos expected key {self.obs_key!r} on tensordict; "
+                f"got keys {list(tensordict.keys())}."
+            )
+        pos_all = tensordict[self.obs_key]
+        if pos_all.shape[-1] != self.dim:
+            raise ValueError(
+                f"{self.obs_key} last dim must be {self.dim} (num_feet={self.num_feet} × 3), "
+                f"got {pos_all.shape[-1]}."
+            )
+
+        result = tensordict[:, :t_out]
+        future_targets: list[torch.Tensor] = []
+        valid_masks: list[torch.Tensor] = []
+
+        for t in range(t_out):
+            root_ref = tensordict["root_state_w"][:, t]
+            quat_ref = root_ref[:, 3:7]
+            pos_root = root_ref[:, :3]
+            window = pos_all[:, t : t + H].reshape(N, H, self.num_feet, 3)
+            rel_feet = quat_rotate_inverse(
+                quat_ref[:, None, None, :],
+                window - pos_root[:, None, None, :],
+            )
+            future_target = rel_feet.reshape(N, H, self.dim)
+            future_targets.append(future_target)
+            episode_id = tensordict["episode_id"]
+            valid = episode_id[:, t] == episode_id[:, t + H - 1]
+            valid_masks.append(valid)
+
+        future_targets = torch.stack(future_targets, dim=1)
+        self.vecnorm._update(future_targets)
+        if normalize:
+            future_targets = self.vecnorm._normalize(future_targets)
+        result["_future_target"] = future_targets
         result["_future_valid"] = torch.stack(valid_masks, dim=1)
         return result
 

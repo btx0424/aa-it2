@@ -21,6 +21,7 @@
 # SOFTWARE.
 from __future__ import annotations
 
+import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -73,8 +74,8 @@ class PPOConfig:
     _target_: str = f"{__package__}.ppo_it2.PPOConfig"
     name: str = "ppo_it2"
     train_every: int = 32
-    ppo_epochs: int = 4
-    num_minibatches: int = 4
+    ppo_epochs: int = 2
+    num_minibatches: int = 8
     lr: float = 5e-4
     clip_param: float = 0.2
     entropy_coef: float = 0.002
@@ -167,6 +168,7 @@ class PPOPolicy(TensorDictModuleBase):
             defm_variant=self.cfg.defm_variant,
             defm_pretrained=self.cfg.defm_pretrained,
         ).to(self.device)
+        self.num_extero_tokens = int(self.fusion_encoder.num_extero_tokens)
 
         actor_module = TDMod(_actor, ["_shared_feature"], ["loc", "scale"])
         critic_module = TDMod(_critic, ["_shared_feature"], ["state_value"])
@@ -211,6 +213,116 @@ class PPOPolicy(TensorDictModuleBase):
         # Initialized conservatively at 1.0 so early training uses a larger (not smaller)
         # value gradient — the EMA ramps up to the true scale within the first few rollouts.
         self._ret_std_ema: float = 1.0
+        self._diag_samples: int = 512
+
+    def _fusion_module(self) -> EncoderTwo:
+        enc = self.fusion_encoder
+        return enc.module if isinstance(enc, DDP) else enc
+
+    @staticmethod
+    def _unwrap_ddp(module: nn.Module) -> nn.Module:
+        return module.module if isinstance(module, DDP) else module
+
+    @staticmethod
+    def _param_grad_norm(params) -> torch.Tensor:
+        params = list(params)
+        device = params[0].device if params else torch.device("cpu")
+        norms = [p.grad.detach().norm() for p in params if p.grad is not None]
+        if not norms:
+            return torch.zeros((), device=device)
+        return torch.linalg.vector_norm(torch.stack(norms))
+
+    @staticmethod
+    def _masked_mean(x: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
+        if mask.any():
+            return x[mask].mean()
+        return x.new_zeros(())
+
+    @torch.no_grad()
+    def _compute_encoder_diagnostics(self, tensordict: TensorDict) -> dict[str, float]:
+        """Cross-attn mass, spatial peak, and shuffle-extero loc probe (subsampled)."""
+        flat = tensordict.reshape(-1)
+        n = int(flat.batch_size[0])
+        k = min(self._diag_samples, n)
+        idx = torch.randperm(n, device=flat.device)[:k]
+        td = flat[idx]
+
+        self.vecnorm(td)
+        cmd_normed = self.cmd_vecnorm(td[CMD_KEY])
+        cmd_query = self._unwrap_ddp(self.cmd_encoder)(cmd_normed).reshape(k, 1, self.token_dim)
+        attn_self, attn_cross = build_policy_attn_masks(
+            1,
+            num_extero_tokens=self.num_extero_tokens,
+            device=self.device,
+        )
+        fusion = self._fusion_module()
+        feat, weights = fusion(
+            cmd_query,
+            td["_obs_normed"],
+            td["_extero_normed"],
+            attn_mask_self=attn_self,
+            attn_mask_cross=attn_cross,
+            return_cross_weights=True,
+        )
+        # MHA: (N, M, 1+P) with average_attn_weights=True
+        w = weights.mean(dim=1) if weights.ndim == 3 else weights
+        p_tokens = int(self.num_extero_tokens)
+        proprio_mass = w[..., 0]
+        extero_mass = w[..., 1:].sum(dim=-1)
+        role = td[CMD_KEY][..., -2].bool()
+
+        infos: dict[str, float] = {
+            "attn/proprio_mass": proprio_mass.mean().item(),
+            "attn/extero_mass": extero_mass.mean().item(),
+            "attn/proprio_mass_chaser": self._masked_mean(proprio_mass, role).item(),
+            "attn/proprio_mass_evader": self._masked_mean(proprio_mass, ~role).item(),
+            "attn/extero_mass_chaser": self._masked_mean(extero_mass, role).item(),
+            "attn/extero_mass_evader": self._masked_mean(extero_mass, ~role).item(),
+        }
+
+        if p_tokens > 1:
+            p = w[..., 1:].clamp_min(1e-8)
+            p = p / p.sum(dim=-1, keepdim=True)
+            ent = -(p * p.log()).sum(dim=-1) / math.log(p_tokens)
+            infos["attn/extero_entropy"] = ent.mean().item()
+        else:
+            infos["attn/extero_entropy"] = 1.0
+
+        hw = fusion.extero_spatial_hw
+        if hw is not None:
+            gh, gw = hw
+            peak = w[..., 1:].argmax(dim=-1)
+            ny = (peak // gw).float() / max(gh - 1, 1)
+            nx = (peak % gw).float() / max(gw - 1, 1)
+            infos["attn/peak_y"] = ny.mean().item()
+            infos["attn/peak_x"] = nx.mean().item()
+            infos["attn/peak_y_chaser"] = self._masked_mean(ny, role).item()
+            infos["attn/peak_x_chaser"] = self._masked_mean(nx, role).item()
+            infos["attn/peak_y_evader"] = self._masked_mean(ny, ~role).item()
+            infos["attn/peak_x_evader"] = self._masked_mean(nx, ~role).item()
+
+        actor = self._unwrap_ddp(self.actor)
+        td["_shared_feature"] = feat.squeeze(-2)
+        td = actor(td)
+        loc = td["loc"].clone()
+        perm = torch.randperm(k, device=td.device)
+        feat_shuf = fusion(
+            cmd_query,
+            td["_obs_normed"],
+            td["_extero_normed"][perm],
+            attn_mask_self=attn_self,
+            attn_mask_cross=attn_cross,
+        )
+        td["_shared_feature"] = feat_shuf.squeeze(-2)
+        td = actor(td)
+        loc_mse = (loc - td["loc"]).square().mean(dim=-1)
+        infos["probe/shuffle_extero_loc_mse"] = loc_mse.mean().item()
+        infos["probe/shuffle_extero_loc_mse_chaser"] = self._masked_mean(loc_mse, role).item()
+        infos["probe/shuffle_extero_loc_mse_evader"] = self._masked_mean(loc_mse, ~role).item()
+
+        _, cnn_std = self.cnn_norm._compute()
+        infos["encoder/cnn_norm_std"] = cnn_std.mean().item()
+        return infos
 
     @classmethod
     def from_env(cls, cfg: PPOConfig, env, device: str):
@@ -234,7 +346,11 @@ class PPOPolicy(TensorDictModuleBase):
         cmd_normed = self.cmd_vecnorm(tensordict[CMD_KEY])
         cmd_query = self.cmd_encoder(cmd_normed).reshape(*tensordict.shape, 1, self.token_dim)
 
-        attn_self, attn_cross = build_policy_attn_masks(1, device=self.device)
+        attn_self, attn_cross = build_policy_attn_masks(
+            1,
+            num_extero_tokens=self.num_extero_tokens,
+            device=self.device,
+        )
         feature = self.fusion_encoder.forward(
             cmd_query,
             tensordict["_obs_normed"],
@@ -355,6 +471,7 @@ class PPOPolicy(TensorDictModuleBase):
         adv[role], std0 = normalize(adv[role], subtract_mean=True) # chaser
         adv[~role], std1 = normalize(adv[~role], subtract_mean=True) # evader
         tensordict["adv"] = adv
+        encoder_diag = self._compute_encoder_diagnostics(tensordict)
 
         for epoch in range(self.cfg.ppo_epochs):
             batch = make_batch(tensordict, self.cfg.num_minibatches)
@@ -383,7 +500,14 @@ class PPOPolicy(TensorDictModuleBase):
         infos["critic/value_mean"] = tensordict["ret"].mean().item()
         infos["critic/value_var"] = tensordict["ret"].var().item()
         infos["critic/ret_std_ema"] = self._ret_std_ema
-        infos["critic/neg_rew_ratio"] = (tensordict[REWARD_KEY].sum(-1) <= 0.).float().mean().item()
+        reward_aggregated = tensordict["next", "reward_aggregated"]
+        infos["critic/neg_rew_ratio"] = (reward_aggregated <= 0.).float().mean().item()
+        ret = tensordict["ret"].reshape_as(role)
+        infos["critic/ret_mean_chaser"] = ret[role].mean().item() if role.any() else 0.0
+        infos["critic/ret_std_chaser"] = ret[role].std(unbiased=False).item() if role.any() else 0.0
+        infos["critic/ret_mean_evader"] = ret[~role].mean().item() if (~role).any() else 0.0
+        infos["critic/ret_std_evader"] = ret[~role].std(unbiased=False).item() if (~role).any() else 0.0
+        infos.update(encoder_diag)
         if aa.is_distributed():
             self.cmd_vecnorm.synchronize(mode="broadcast")
             self.mlp_norm.synchronize(mode="broadcast")
@@ -407,7 +531,13 @@ class PPOPolicy(TensorDictModuleBase):
         values = tensordict["state_value"]
         next_values = tensordict["next", "state_value"]
 
-        rewards = tensordict[REWARD_KEY].sum(-1, keepdim=True)# .clamp_min(0.)
+        rewards = tensordict[REWARD_KEY]
+        if isinstance(rewards, TensorDict):
+            rewards = torch.concat(list(rewards.values()), dim=-1)
+        rewards = rewards.sum(-1, keepdim=True)
+        tensordict["next", "reward_aggregated"] = rewards
+        # scale according to the effective horizon
+        rewards = rewards * (1. - self.gae.gamma)
         discount = tensordict["next", "discount"]
         terms = tensordict[TERM_KEY]
         dones = tensordict[DONE_KEY]
@@ -484,6 +614,11 @@ class PPOPolicy(TensorDictModuleBase):
             allreduce_grads(self.actor.parameters())
             allreduce_grads(self.critic.parameters())
 
+        enc = self._fusion_module()
+        cnn_grad_norm = self._param_grad_norm(enc.extero_cnn.parameters())
+        self_attn_grad_norm = self._param_grad_norm(enc.self_attn.parameters())
+        cross_attn_grad_norm = self._param_grad_norm(enc.cross_attn.parameters())
+
         encoder_grad_norm = nn.utils.clip_grad_norm_(self.fusion_encoder.parameters(), self.max_grad_norm)
         cmd_encoder_grad_norm = nn.utils.clip_grad_norm_(self.cmd_encoder.parameters(), self.max_grad_norm)
         actor_grad_norm = nn.utils.clip_grad_norm_(self.actor.parameters(), self.max_grad_norm)
@@ -503,6 +638,10 @@ class PPOPolicy(TensorDictModuleBase):
         return {
             "encoder/grad_norm": encoder_grad_norm,
             "encoder/cmd_grad_norm": cmd_encoder_grad_norm,
+            "encoder/cnn_grad_norm": cnn_grad_norm,
+            "encoder/self_attn_grad_norm": self_attn_grad_norm,
+            "encoder/cross_attn_grad_norm": cross_attn_grad_norm,
+            "actor/valid_frac": valid.float().mean(),
             "actor/policy_loss": policy_loss.detach(),
             "actor/entropy": entropy.detach(),
             "actor/grad_norm": actor_grad_norm,

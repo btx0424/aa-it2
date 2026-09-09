@@ -11,33 +11,54 @@ ExteroEncoderKind = Literal["cnn", "defm_cnn"]
 DefmCnnVariant = Literal["defm_resnet18", "defm_regnet_y_400mf"]
 
 
+def _conv_out_hw(height: int, width: int, *, stride: int = 2, padding: int = 1, kernel: int = 3) -> tuple[int, int]:
+    """Spatial size after one Conv2d (matches PyTorch ``floor`` output formula)."""
+    h = (height + 2 * padding - kernel) // stride + 1
+    w = (width + 2 * padding - kernel) // stride + 1
+    return h, w
+
+
+def cnn_feature_hw(height: int, width: int, *, num_stride2: int = 3) -> tuple[int, int]:
+    """Feature-map ``(H, W)`` after ``num_stride2`` stride-2 3×3 convs (padding 1)."""
+    h, w = int(height), int(width)
+    for _ in range(num_stride2):
+        h, w = _conv_out_hw(h, w)
+    return h, w
+
+
 def build_policy_future_attn_masks(
     num_command_slots: int,
     *,
+    num_extero_tokens: int = 1,
     device: torch.device,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Build (self_attn, cross_attn) boolean masks for :class:`EncoderTwo` future training.
 
     Future prediction uses **exactly two** learned query embeddings (``fut_0``, ``fut_1``).
-    Layout: ``[cmd_0, …, cmd_{K-1}, fut_0, fut_1, proprio, extero]`` with ``K = num_command_slots``.
+    Layout: ``[cmd_0, …, cmd_{K-1}, fut_0, fut_1, proprio, extero_0, …]`` with
+    ``K = num_command_slots`` and ``P = num_extero_tokens`` spatial extero tokens.
 
-    **Self-attention** (shape ``(K+4, K+4)``): query–query block blocks cross-talk between
-    query slots; command slots reach proprio/extero by default; ``fut_0`` may attend only to
-    proprio; ``fut_1`` to proprio and extero.
+    **Self-attention**: query–query block blocks cross-talk between query slots;
+    command slots reach proprio/extero by default; ``fut_0`` may attend only to
+    proprio; ``fut_1`` to proprio and all extero tokens.
 
-    **Cross-attention** (shape ``(K+2, 2)``): command slots attend to both modalities;
-    ``fut_0`` only to proprio; ``fut_1`` to both.
+    **Cross-attention** (shape ``(K+2, 1+P)``): command slots attend to proprio and
+    all extero tokens; ``fut_0`` only to proprio; ``fut_1`` to proprio and extero.
 
     ``True`` means *masked* (cannot attend), per :class:`torch.nn.MultiheadAttention`.
     """
     F = 2
     if num_command_slots < 1:
         raise ValueError(f"num_command_slots must be >= 1, got {num_command_slots}")
+    if num_extero_tokens < 1:
+        raise ValueError(f"num_extero_tokens must be >= 1, got {num_extero_tokens}")
 
     K = num_command_slots
+    P = num_extero_tokens
     M = K + F
-    L = M + 2
-    prop_i, ext_i = M, M + 1
+    ctx = 1 + P
+    L = M + ctx
+    prop_i = M
 
     mask_self = torch.zeros(L, L, dtype=torch.bool, device=device)
     mask_self[:M, :M] = ~torch.eye(M, dtype=torch.bool, device=device)
@@ -47,15 +68,13 @@ def build_policy_future_attn_masks(
         mask_self[idx, :] = True
         mask_self[idx, prop_i] = False
         if j >= 1:
-            mask_self[idx, ext_i] = False
+            mask_self[idx, prop_i + 1 :] = False
 
-    mask_cross = torch.zeros(M, 2, dtype=torch.bool, device=device)
-    for i in range(K):
-        mask_cross[i, :] = False
+    mask_cross = torch.zeros(M, ctx, dtype=torch.bool, device=device)
     for j in range(F):
         idx = K + j
         mask_cross[idx, 0] = False
-        mask_cross[idx, 1] = j == 0
+        mask_cross[idx, 1:] = j == 0
 
     return mask_self, mask_cross
 
@@ -63,32 +82,37 @@ def build_policy_future_attn_masks(
 def build_policy_attn_masks(
     num_command_slots: int,
     *,
+    num_extero_tokens: int = 1,
     device: torch.device,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Self/cross masks for policy forward **without** future query slots.
 
-    Layout: ``[cmd_0, …, cmd_{K-1}, proprio, extero]`` (length ``K + 2``).
+    Layout: ``[cmd_0, …, cmd_{K-1}, proprio, extero_0, …]`` (length ``K + 1 + P``).
 
     **Self-attention**: command tokens do not attend to *other* command tokens (same
     pattern as :func:`build_policy_future_attn_masks` for the command block); each
-    command may still attend to itself, proprio, and extero. Proprio and extero
-    attend without restriction.
+    command may still attend to itself, proprio, and all extero tokens. Proprio and
+    extero attend without restriction.
 
-    **Cross-attention** (shape ``(K, 2)``): every command attends to both modalities
-    (no masking).
+    **Cross-attention** (shape ``(K, 1+P)``): every command attends to proprio and
+    all extero tokens (no masking).
 
     ``True`` means *masked* (cannot attend), per :class:`torch.nn.MultiheadAttention`.
     """
     if num_command_slots < 1:
         raise ValueError(f"num_command_slots must be >= 1, got {num_command_slots}")
+    if num_extero_tokens < 1:
+        raise ValueError(f"num_extero_tokens must be >= 1, got {num_extero_tokens}")
 
     K = num_command_slots
-    L = K + 2
+    P = num_extero_tokens
+    ctx = 1 + P
+    L = K + ctx
 
     mask_self = torch.zeros(L, L, dtype=torch.bool, device=device)
     mask_self[:K, :K] = ~torch.eye(K, dtype=torch.bool, device=device)
 
-    mask_cross = torch.zeros(K, 2, dtype=torch.bool, device=device)
+    mask_cross = torch.zeros(K, ctx, dtype=torch.bool, device=device)
     return mask_self, mask_cross
 
 
@@ -97,6 +121,7 @@ def simple_extero_encoder(
     token_dim: int,
     activation: Type[nn.Module],
 ) -> nn.Sequential:
+    """Stride-2 conv stem → ``(N, token_dim, H', W')`` spatial tokens (no global pool)."""
     return nn.Sequential(
         nn.Conv2d(extero_channels, 32, kernel_size=3, stride=2, padding=1),
         activation(),
@@ -104,8 +129,6 @@ def simple_extero_encoder(
         activation(),
         nn.Conv2d(64, token_dim, kernel_size=3, stride=2, padding=1),
         activation(),
-        nn.AdaptiveAvgPool2d(1),
-        nn.Flatten(start_dim=1),
     )
 
 
@@ -115,6 +138,8 @@ class ExteroDefmCnn(nn.Module):
     Expects ``extero_inp`` shaped ``(..., C, H, W)`` with **channel 0** as a metric depth map
     (meters). Uses :func:`defm.utils.preprocess_depth_batch` (vectorized torch, same logic as
     ``preprocess_depth_image``). Extra channels are ignored (only the first depth channel is used).
+
+    Returns a single global token ``(N, token_dim)``.
     """
 
     VARIANTS: tuple[str, ...] = ("defm_resnet18", "defm_regnet_y_400mf")
@@ -191,15 +216,14 @@ def build_extero_encoder(
 
 
 class EncoderTwo(nn.Module):
-    """Fuse multiple command query tokens with proprio and extero.
+    """Fuse multiple command query tokens with proprio and spatial extero.
 
     Pipeline:
 
-    1. **Embed** proprio and extero into tokens; **LN** precomputed query tokens
-       (order: queries → proprio → extero).
-    2. **Self-attention** over all ``M + 2`` tokens (residual + layer norm + FFN).
-    3. **Cross-attention**: query rows attend to proprio and extero tokens (optional
-       per-slot mask).
+    1. **Embed** proprio (1 token) and extero (``P`` spatial tokens, or 1 if DeFM);
+       **LN** precomputed query tokens (order: queries → proprio → extero patches).
+    2. **Self-attention** over all ``M + 1 + P`` tokens (residual + layer norm + FFN).
+    3. **Cross-attention**: query rows attend to proprio and all extero tokens.
     4. **Return** refined query tokens ``(..., M, token_dim)``.
     """
 
@@ -216,7 +240,10 @@ class EncoderTwo(nn.Module):
     ):
         super().__init__()
         self.token_dim = token_dim
+        self.extero_encoder_kind = extero_encoder
         extero_channels = extero_shape[0] if len(extero_shape) == 3 else 1
+        extero_h = int(extero_shape[-2]) if len(extero_shape) >= 2 else 1
+        extero_w = int(extero_shape[-1]) if len(extero_shape) >= 1 else 1
 
         self.proprio_mlp = MLP([proprio_shape[-1], 256, token_dim], activation=activation, first_non_muon=True)
         self.extero_cnn = build_extero_encoder(
@@ -227,6 +254,17 @@ class EncoderTwo(nn.Module):
             token_dim=token_dim,
             activation=activation,
         )
+        if extero_encoder == "cnn":
+            gh, gw = cnn_feature_hw(extero_h, extero_w)
+            self.extero_spatial_hw = (gh, gw)
+            self.num_extero_tokens = gh * gw
+            self.extero_pos = nn.Parameter(torch.zeros(1, token_dim, gh, gw))
+            nn.init.trunc_normal_(self.extero_pos, std=0.02)
+        else:
+            self.extero_spatial_hw = None
+            self.num_extero_tokens = 1
+            self.extero_pos = None
+
         self.query_ln = nn.LayerNorm(token_dim)
         self.proprio_ln = nn.LayerNorm(token_dim)
         self.extero_ln = nn.LayerNorm(token_dim)
@@ -264,6 +302,24 @@ class EncoderTwo(nn.Module):
         init_(self.self_attn)
         init_(self.cross_attn)
 
+    def _embed_extero(self, extero_inp: torch.Tensor) -> torch.Tensor:
+        """``(N, C, H, W)`` → ``(N, P, token_dim)`` spatial (CNN) or global (DeFM) tokens."""
+        feat = self.extero_cnn(extero_inp)
+        if feat.ndim == 2:
+            return self.extero_ln(feat).unsqueeze(1)
+        if feat.ndim != 4:
+            raise ValueError(f"extero encoder must return (N, D) or (N, D, H, W), got {tuple(feat.shape)}")
+        _, _, gh, gw = feat.shape
+        pos = self.extero_pos
+        if pos is not None and (pos.shape[-2] != gh or pos.shape[-1] != gw):
+            pos = torch.nn.functional.interpolate(
+                pos, size=(gh, gw), mode="bilinear", align_corners=False
+            )
+        if pos is not None:
+            feat = feat + pos
+        tokens = feat.flatten(2).transpose(1, 2).contiguous()
+        return self.extero_ln(tokens)
+
     def forward(
         self,
         queries_inp: Float[torch.Tensor, "... M token_dim"],
@@ -271,7 +327,8 @@ class EncoderTwo(nn.Module):
         extero_inp: Float[torch.Tensor, "... C H W"],
         attn_mask_self: torch.Tensor | None = None,
         attn_mask_cross: torch.Tensor | None = None,
-    ) -> Float[torch.Tensor, "... M token_dim"]:
+        return_cross_weights: bool = False,
+    ) -> Float[torch.Tensor, "... M token_dim"] | tuple[torch.Tensor, torch.Tensor]:
         batch_shape = queries_inp.shape[:-2]
         N = batch_shape.numel()
         M = queries_inp.shape[-2]
@@ -282,11 +339,11 @@ class EncoderTwo(nn.Module):
 
         queries = self.query_ln(queries)
         proprio_feature = self.proprio_ln(self.proprio_mlp(proprio_flat)).reshape(N, 1, self.token_dim)
-        extero_feature = self.extero_ln(self.extero_cnn(extero_flat)).reshape(N, 1, self.token_dim)
+        extero_feature = self._embed_extero(extero_flat)
 
         tokens = torch.cat(
             [queries, proprio_feature, extero_feature], dim=1
-        ) # [N, M + 2, self.token_dim]
+        )  # [N, M + 1 + P, token_dim]
 
         with sdpa_kernel(backends=[SDPBackend.MATH]):
             sa_out, _ = self.self_attn(
@@ -299,15 +356,20 @@ class EncoderTwo(nn.Module):
         tokens = self.self_attn_norm(tokens + sa_out)
         tokens = tokens + self.ffn(tokens)
 
-        query_token = tokens[:, :-2, :] # [N, M, self.token_dim]
-        proprio_extero = tokens[:, -2:, :] # [N, 2, self.token_dim]
+        query_token = tokens[:, :M, :]
+        context = tokens[:, M:, :]
         with sdpa_kernel(backends=[SDPBackend.MATH]):
-            cross_out, _ = self.cross_attn(
+            cross_out, cross_weights = self.cross_attn(
                 query_token,
-                proprio_extero,
-                proprio_extero,
+                context,
+                context,
                 attn_mask=attn_mask_cross,
-                need_weights=False,
+                need_weights=return_cross_weights,
+                average_attn_weights=True,
             )
-        query_refined = self.cross_attn_norm(query_token + cross_out) # [N, M, self.token_dim]
-        return query_refined.reshape(*batch_shape, M, self.token_dim)
+        query_refined = self.cross_attn_norm(query_token + cross_out)
+        query_refined = query_refined.reshape(*batch_shape, M, self.token_dim)
+        if return_cross_weights:
+            # (N, M, 1+P) averaged over heads
+            return query_refined, cross_weights
+        return query_refined

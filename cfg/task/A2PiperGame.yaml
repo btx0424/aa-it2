@@ -1,0 +1,154 @@
+# @package task
+name: A2Game
+project: aa-it2
+
+viewer:
+  resolution: [1280, 720]
+  lookat: [0., 0., 0.]
+  eye: [4.0, 4.0, 4.0]
+  viser: false
+
+robot:
+  name: unitree_a2_piper
+terrain: game_410
+
+# common
+num_envs: 4096
+max_episode_length: 1000
+nan_guard: sanitize
+
+sensors:
+  game_camera:
+    _target_: lambert_raycast_camera
+    resolution: [40, 32]
+    fov_y_deg: 90.0
+    near: 0.1
+    far: 4.0
+    targets: [terrain]
+
+sim:
+  step_dt: 0.02
+  isaac_physics_dt: 0.005
+  mujoco_physics_dt: 0.002
+
+input:
+  action:
+    _target_: ConcatenatedAction
+    actions:
+      - _target_: JointPosition
+        action_scaling:
+          .*_hip_joint: 0.5
+          .*_thigh_joint: 0.5
+          .*_calf_joint: 0.5
+        max_delay: 1
+        alpha_range: [0.9, 1.0]
+      - _target_: JointReferenceModel
+        action_scaling:
+          arm_joint[1-3]: 1.0
+          arm_joint[4-6]: 0.5
+        omega: 20.0
+        max_delay: 1
+      - _target_: CorrelatedJointPosition
+        joint_names: "arm_joint[7,8]"
+        matrix: [1.0, -1.0]
+        action_scaling: 0.035
+  
+
+command:
+  _target_: Game
+  catch_radius: 0.8
+
+observation:
+  primary_command:
+    command:  {key: primary}
+  secondary_command:
+    command:  {key: secondary}
+  command_mode:
+    command:  {key: mode}
+  policy:
+    gravity_multistep: {steps: 4, noise_std: 0.05}
+    joint_pos_multistep: {steps: 4, noise_std: 0.05}
+    joint_vel_multistep: {steps: 4, noise_std: 0.2}
+    prev_actions: {steps: 2}
+  # priv:
+    root_linvel_b:    {yaw_only: true}
+    root_angvel_b:    {}
+    feet_height_map: {
+      feet_names: .*_foot,
+      nomial_height: 0.3,
+      clamp_range: [-1., 1.],
+      flatten: true,
+    }
+  extero:
+    raycast_camera:
+      sensor_name: game_camera
+      body_name: grasp_point
+      frequency: 30.0
+      offset_pos: [-0.1, 0.0, 0.06]
+      offset_rpy_deg: [0.0, 10.0, 0.0]
+      data_type: depth
+      dtype: float16
+  root_state_w:
+    root_state_w: {}
+
+reward:
+  loco:
+    game.chase_distance_change: {weight: 16.0}
+    game.chase_velocity:      {weight: 2.0}
+    game.chase_distance:      {weight: 2.0}
+    game.evade_distance_change: {weight: 8.0}
+    game.evade_velocity:      {weight: 2.0}
+    game.evade_distance:      {weight: 2.0}
+    game.target_in_sight:     {weight: 1.0}
+    game.caught_reward:       {weight: 50.0}
+    game.stall_penalty:       {weight: 1.0}
+    angvel_xy_l2:       {weight: 0.02}
+    linvel_z_l2:        {weight: 2.0}
+    base_height_exp:    {weight: 1.0, target_height: 0.4}
+  regularization:
+    energy_l1:          {weight: 0.0002}
+    joint_acc_l2:       {weight: 2.5e-7, joint_names: "(?!(arm_joint[7,8])).*" } # exclude gripper joints
+    joint_torques_l2:   {weight: 1.0e-4, joint_names: "(?!(arm_joint[7,8])).*" } # exclude gripper joints
+    survival:           {weight: 1.0}
+    action_rate_l2:     {weight: 0.01}
+    action_rate2_l2:    {weight: 0.002}
+    feet_air_time:      {weight: 0.4, body_names: .*_foot, thres: 0.5}
+    max_swing_height:   {weight: 4.0, body_names: .*_foot, target_height: 0.15}
+    feet_sliding:       {weight: 0.2, body_names: .*_foot}
+    undesired_contact:  {body_names: [.*_calf, .*thigh], weight: 0.25}
+  debug:
+    _enabled_: false
+    feet_contact_count: {weight: 1.0, body_names: .*_foot}
+    # feet_swing_height:  {weight: 0.1, target_height: 0.1}
+
+termination:
+  max_episode_length: {}
+  crash: {body_names_expr: [base_link, .*hip, .*thigh], t_thres: 0.06, prob: 0.5}
+  fall_over: {xy_thres: 0.9}
+  undesired_contact: {body_names: [.*_calf]}
+  # game.caught_termination: {}
+  game.both_terminate: {}
+
+randomization:
+  perturb_body_mass:
+    (?!(payload|base_link)).*: [0.8, 1.2]
+    base_link: [0.8, 1.2]
+  randomize_materials_isaac:
+    body_names: .*_foot
+    static_friction_range:  [0.5, 3.0]
+    dynamic_friction_range: [0.5, 3.0]
+    restitution_range:      [0.0, 0.5]
+    homogeneous: true
+  motor_params:
+    stiffness_range:
+      .*: [0.8, 1.1]
+    damping_range:
+      .*: [0.8, 1.1]
+  reset_joint_states_scale:
+    pos_scales:
+      .*: [0.8, 1.2]
+  push_body:
+    body_names: "base_link"
+    force_range: [30, 80]
+    min_interval: 100
+    decay: 0.9

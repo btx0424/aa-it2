@@ -74,6 +74,7 @@ class PPOConfig:
     _target_: str = f"{__package__}.ppo_it2.PPOConfig"
     name: str = "ppo_it2"
     train_every: int = 32
+    store_transitions: bool = False
     ppo_epochs: int = 2
     num_minibatches: int = 8
     lr: float = 5e-4
@@ -351,7 +352,8 @@ class PPOPolicy(TensorDictModuleBase):
             num_extero_tokens=self.num_extero_tokens,
             device=self.device,
         )
-        feature = self.fusion_encoder.forward(
+        # Call the module, not .forward(): DDP only hooks __call__.
+        feature = self.fusion_encoder(
             cmd_query,
             tensordict["_obs_normed"],
             tensordict["_extero_normed"],
@@ -516,6 +518,16 @@ class PPOPolicy(TensorDictModuleBase):
         return dict(sorted(infos.items()))
 
     @torch.no_grad()
+    def compute_value(self, tensordict: TensorDict):
+        """Bootstrap V(s) for the collector when ``store_transitions=False``.
+
+        ``train_ppo`` keeps critic outputs on the rollout but drops ``next`` obs, so
+        the last bootstrap value is ``compute_value(carry)``. Must run the shared
+        encoder, not ``self.critic`` alone.
+        """
+        return self.run_policy(tensordict, actor=False, critic=True)
+
+    @torch.no_grad()
     def _compute_advantage(
         self, 
         tensordict: TensorDict,
@@ -524,6 +536,7 @@ class PPOPolicy(TensorDictModuleBase):
     ):
         keys = tensordict.keys(True, True)
         if not ("state_value" in keys and ("next", "state_value") in keys):
+            raise ValueError("state_value and next,state_value are not in the tensordict")
             with tensordict.view(-1) as tensordict_flat:
                 self.run_policy(tensordict_flat, actor=False, critic=True)
                 self.run_policy(tensordict_flat["next"], actor=False, critic=True)

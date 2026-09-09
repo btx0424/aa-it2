@@ -1,10 +1,12 @@
 # @package task
 name: A2Game
+project: aa-it2
 
 viewer:
   resolution: [1280, 720]
   lookat: [0., 0., 0.]
   eye: [4.0, 4.0, 4.0]
+  viser: false
 
 robot:
   name: unitree_a2
@@ -13,6 +15,16 @@ terrain: game_410
 # common
 num_envs: 4096
 max_episode_length: 1000
+nan_guard: sanitize
+
+sensors:
+  game_camera:
+    _target_: lambert_raycast_camera
+    resolution: [40, 32]
+    fov_y_deg: 90.0
+    near: 0.1
+    far: 4.0
+    targets: [terrain]
 
 sim:
   step_dt: 0.02
@@ -61,15 +73,11 @@ observation:
       flatten: true,
     }
   extero:
-    raycast_camera: {
-      resolution: [40, 32],
-      # resolution: [96, 96],
-      fov_deg: 90.0,
-      rpy_deg: [0.0, 30.0, 0.0],
-      near: 0.1,
-      far: 4.0,
-      body_name: "base_link",
-    }
+    raycast_camera:
+      sensor_name: game_camera
+      body_name: base_link
+      offset_rpy_deg: [0.0, 30.0, 0.0]
+      data_type: depth
   root_state_w:
     root_state_w: {}
 
@@ -114,11 +122,12 @@ randomization:
   perturb_body_mass:
     (?!(payload|base_link)).*: [0.8, 1.2]
     base_link: [0.8, 1.2]
-  perturb_body_materials:
+  randomize_materials_isaac:
     body_names: .*_foot
     static_friction_range:  [0.5, 3.0]
     dynamic_friction_range: [0.5, 3.0]
     restitution_range:      [0.0, 0.5]
+    homogeneous: true
   motor_params:
     stiffness_range:
       .*: [0.8, 1.1]

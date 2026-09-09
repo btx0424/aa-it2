@@ -1,12 +1,14 @@
 import torch
 import warp as wp
+from tensordict import TensorDictBase
+from typing_extensions import override
 
+from active_adaptation.envs.env_base import _EnvBase
 from active_adaptation.envs.mdp import Command, Reward, Termination
 from active_adaptation.utils.math import (
     quat_rotate_inverse,
     quat_rotate,
     normalize,
-    quat_mul,
     sample_quat_yaw,
 )
 from active_adaptation.utils.symmetry import SymmetryTransform
@@ -22,18 +24,22 @@ class Game(Command):
     clip was first recorded under the primary command). Primary episodes still run first to
     fill the recording buffer.
     """
+
     def __init__(
         self,
-        env,
         catch_radius: float = 0.8,
         secondary_command: bool = False,
     ) -> None:
-        super().__init__(env)
+        super().__init__()
         self.catch_radius = catch_radius
         self.secondary_command = secondary_command
 
+    @override
+    def _initialize(self, env: _EnvBase) -> None:
+        super()._initialize(env)
+
         from active_adaptation.envs.terrain import BetterTerrainImporter, BetterTerrainGenerator
-        from active_adaptation.envs.backends.isaac import IsaacSceneAdapter
+        from active_adaptation.envs.backends.isaaclab import IsaacSceneAdapter
         from it2.utils import find_flat_patches
 
         self.scene: IsaacSceneAdapter = self.env.scene
@@ -57,7 +63,7 @@ class Game(Command):
             z_range=(-0.1, 0.1),
             max_height_diff=0.1,
         )
-        
+
         with torch.device(self.device):
             self.role = torch.arange(self.num_envs) % 2
             self.target_caught_time = torch.zeros(self.num_envs, 1)
@@ -70,7 +76,10 @@ class Game(Command):
             self.init_angle_range = torch.zeros(self.origins.shape[0], 2)
             self.init_angle_range[:, 0] = -torch.pi
             self.init_angle_range[:, 1] = torch.pi
-            is_corridor = self.terrain_generator.sub_terrain_types == self.terrain_generator.sub_terrain_type_mapping.get("curved_corridor", -1)
+            is_corridor = (
+                self.terrain_generator.sub_terrain_types
+                == self.terrain_generator.sub_terrain_type_mapping.get("curved_corridor", -1)
+            )
             self.init_angle_range[is_corridor, 0] = 0.0
             self.init_angle_range[is_corridor, 1] = 0.0
 
@@ -83,7 +92,7 @@ class Game(Command):
             # respawns here so replay t=0 matches the recorded clip.
             self.replay_start_root_state_w = torch.zeros(self.num_envs, 13)
 
-        if self.env.sim.has_gui() and self.env.backend == "isaac":
+        if self.env.sim.has_gui() and self.env.backend == "isaaclab":
             self.marker = self.scene.create_arrow_marker(
                 prim_path="/Visuals/Command/arrow",
                 color=(1.0, 0.0, 0.0),
@@ -99,7 +108,8 @@ class Game(Command):
                 color=(1.0, 1.0, 0.0),
                 radius=0.1,
             )
-        self.update()
+
+        self._update()
 
     def command(self, key: str = "primary"):
         if key == "primary":
@@ -114,7 +124,7 @@ class Game(Command):
                 ],
                 dim=-1,
             )
-        elif key == "secondary":
+        if key == "secondary":
             n = torch.arange(self.num_envs, device=self.device)
             L = self.recorded_root_state_w.shape[1]
             t = self.env.episode_length_buf.reshape(self.num_envs).long().clamp(0, L - 1)
@@ -129,38 +139,38 @@ class Game(Command):
             root_ang_vel_b = quat_rotate_inverse(root_quat_w, root_ang_vel_w)
             return torch.cat(
                 [
-                    root_pos_b[:, :2], # only xy
-                    root_lin_vel_b[:, :2], # only xy
-                    root_ang_vel_b[:, 2:3], # only yaw
+                    root_pos_b[:, :2],  # only xy
+                    root_lin_vel_b[:, :2],  # only xy
+                    root_ang_vel_b[:, 2:3],  # only yaw
                 ],
                 dim=-1,
             )
-        elif key == "mode":
+        if key == "mode":
             return self.command_mode.reshape(self.num_envs, 1)
-        else:
-            raise ValueError(f"Invalid key: {key}")
+        raise ValueError(f"Invalid key: {key}")
 
     def symmetry_transform(self, key: str = "primary"):
         # the general rule is to flip y, roll, and yaw components (if present)
         if key == "primary":
             return SymmetryTransform(
                 perm=torch.arange(8),
-                signs=torch.tensor([1, -1, 1, 1, -1, 1, 1, 1])
+                signs=torch.tensor([1, -1, 1, 1, -1, 1, 1, 1]),
             )
-        elif key == "secondary":
+        if key == "secondary":
             return SymmetryTransform(
-                perm=torch.arange(2 + 2 + 1), # pos_xy + vel_xy + yaw_rate
-                signs=torch.tensor([1, -1, 1, -1, -1])
+                perm=torch.arange(2 + 2 + 1),  # pos_xy + vel_xy + yaw_rate
+                signs=torch.tensor([1, -1, 1, -1, -1]),
             )
-        else:
-            raise ValueError(f"Invalid key: {key}")
+        raise ValueError(f"Invalid key: {key}")
 
-    def sample_init(self, env_ids: torch.Tensor) -> torch.Tensor:
+    @override
+    def reset(self, env_ids: torch.Tensor, tensordict: TensorDictBase) -> torch.Tensor:
         self.env.extra["curriculum/distance_traveled"] = self.distance_traveled.mean()
         self.distance_traveled[env_ids] = 0.0
 
         num_r = env_ids.shape[0]
         init_root_state = self.init_root_state[env_ids].clone()
+        result_origins = self.env.scene.env_origins[env_ids].clone()
 
         # Per-env: secondary mode only after at least one completed episode (buffer filled).
         if self.secondary_command:
@@ -201,6 +211,7 @@ class Game(Command):
             init_p[~chase, :3] += init_pos - offset
             init_p[:, 3:7] = sample_quat_yaw(np_, device=self.device)
             init_root_state[prim] = init_p
+            result_origins[prim] = origins
             if self.secondary_command:
                 self.replay_start_root_state_w[pids] = init_p.clone()
 
@@ -210,12 +221,19 @@ class Game(Command):
             sids = env_ids[sec]
             init_root_state[sec] = self.replay_start_root_state_w[sids].clone()
 
-        return init_root_state
+        self._write_initial_states({"robot": init_root_state}, env_ids)
+        entity = self.env.scene["robot"]
+        entity.write_joint_state_to_sim(
+            self.init_joint_pos[env_ids],
+            self.init_joint_vel[env_ids],
+            env_ids=env_ids,
+        )
 
-    def reset(self, env_ids: torch.Tensor):
         self.target_caught_time[env_ids] = 0.0
+        return result_origins
 
-    def update(self):
+    @override
+    def _update(self) -> None:
         L = self.recorded_root_state_w.shape[1]
         n = torch.arange(self.num_envs, device=self.device)
         t = self.env.episode_length_buf.long().clamp(0, L - 1)
@@ -237,13 +255,13 @@ class Game(Command):
             1,
         ).reshape(self.num_envs, 3)
         self.target_diff = self.target_pos_w - self.asset.data.root_pos_w
-        
+
         distance = self.target_diff[:, :2].norm(dim=-1, keepdim=True)
         self.distance_change = distance - self.last_distance
         self.last_distance = distance.clone()
         self.distance = distance
 
-        self.target_caught = self.distance < 0.8
+        self.target_caught = self.distance < self.catch_radius
         self.target_caught_time = torch.where(
             self.target_caught,
             self.target_caught_time + self.env.step_dt,
@@ -254,13 +272,17 @@ class Game(Command):
         speed = self.asset.data.root_link_lin_vel_w[:, :2].norm(dim=-1, keepdim=True)
         self.distance_traveled += speed * self.env.step_dt
 
+    @override
     def debug_draw(self):
-        self.env.debug_draw.vector(
+        if not self.env.sim.has_gui():
+            return
+        self.env.scene.draw_vector(
             self.asset.data.root_pos_w[::2],
             self.target_diff[::2],
-            # self.asset.data.root_pos_w[1::2] - self.asset.data.root_pos_w[::2],
             color=(1, 0, 0, 1),
         )
+        if not hasattr(self, "marker"):
+            return
         self.marker.visualize(
             self.asset.data.root_pos_w[::2]
             + torch.tensor([0.0, 0.0, 0.2], device=self.device),
@@ -287,10 +309,14 @@ class chase_distance_change(Reward[Game]):
 class chase_velocity(Reward[Game]):
     namespace = "game"
 
-    def __init__(self, env, weight: float):
-        super().__init__(env, weight)
-        self.asset = self.command_manager.asset
+    def __init__(self, weight: float, enabled: bool = True):
+        super().__init__(weight, enabled=enabled)
         self.a = 2.0
+
+    @override
+    def _initialize(self, env: _EnvBase) -> None:
+        super()._initialize(env)
+        self.asset = self.command_manager.asset
 
     def _compute(self) -> tuple[torch.Tensor, torch.Tensor]:
         is_chaser = self.command_manager.role[:, None] == 0
@@ -304,10 +330,14 @@ class chase_velocity(Reward[Game]):
 class evade_velocity(Reward[Game]):
     namespace = "game"
 
-    def __init__(self, env, weight: float):
-        super().__init__(env, weight)
-        self.asset = self.command_manager.asset
+    def __init__(self, weight: float, enabled: bool = True):
+        super().__init__(weight, enabled=enabled)
         self.a = 2.0
+
+    @override
+    def _initialize(self, env: _EnvBase) -> None:
+        super()._initialize(env)
+        self.asset = self.command_manager.asset
 
     def _compute(self) -> tuple[torch.Tensor, torch.Tensor]:
         is_evader = self.command_manager.role[:, None] == 1
@@ -331,9 +361,6 @@ class evade_distance_change(Reward[Game]):
 class evade_distance(Reward[Game]):
     namespace = "game"
 
-    def __init__(self, env, weight: float):
-        super().__init__(env, weight)
-
     def _compute(self) -> tuple[torch.Tensor, torch.Tensor]:
         is_active = torch.arange(self.num_envs, device=self.device) % 2 == 1
         rew = 1 - torch.exp(-self.command_manager.distance * 0.5)
@@ -342,9 +369,6 @@ class evade_distance(Reward[Game]):
 
 class chase_distance(Reward[Game]):
     namespace = "game"
-
-    def __init__(self, env, weight: float):
-        super().__init__(env, weight)
 
     def _compute(self) -> tuple[torch.Tensor, torch.Tensor]:
         is_active = torch.arange(self.num_envs, device=self.device) % 2 == 0
@@ -355,8 +379,9 @@ class chase_distance(Reward[Game]):
 class target_in_sight(Reward[Game]):
     namespace = "game"
 
-    def __init__(self, env, weight: float):
-        super().__init__(env, weight)
+    @override
+    def _initialize(self, env: _EnvBase) -> None:
+        super()._initialize(env)
         self.asset = self.command_manager.asset
 
     def _compute(self) -> torch.Tensor:
@@ -381,8 +406,9 @@ class caught_reward(Reward[Game]):
 class stall_penalty(Reward[Game]):
     namespace = "game"
 
-    def __init__(self, env, weight: float):
-        super().__init__(env, weight)
+    @override
+    def _initialize(self, env: _EnvBase) -> None:
+        super()._initialize(env)
         self.asset = self.command_manager.asset
 
     def _compute(self) -> tuple[torch.Tensor, torch.Tensor]:

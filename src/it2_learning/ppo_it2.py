@@ -31,7 +31,6 @@ from contextlib import nullcontext
 
 from torchrl.data import Composite, TensorSpec
 from torchrl.modules import ProbabilisticActor
-from torchrl.objectives import hold_out_net
 from tensordict import TensorDict
 from tensordict.nn import (
     TensorDictModuleBase,
@@ -40,8 +39,8 @@ from tensordict.nn import (
 )
 
 from hydra.core.config_store import ConfigStore
-from dataclasses import dataclass, asdict, field
-from typing import Union, Tuple, Literal
+from dataclasses import dataclass, asdict
+from typing import Tuple
 from collections import OrderedDict
 
 from active_adaptation.learning.modules import (
@@ -62,13 +61,7 @@ from active_adaptation.learning.ppo.common import (
 )
 CMD_KEY = "primary_command"
 
-from it2_learning.encoders import (
-    EncoderTwo,
-    build_policy_attn_masks,
-    build_policy_future_attn_masks,
-)
-from it2_learning.future_pred import VAEFuturePredictor, CFMFuturePredictor
-from it2_learning.future_relabel import FutureRelabel, FutureState, FutureTrajectory, LocomotionCommand
+from it2_learning.encoders import EncoderTwo, build_policy_attn_masks
 
 import active_adaptation as aa
 import torch.distributed as distr
@@ -76,47 +69,8 @@ from torch.nn.parallel import DistributedDataParallel as DDP
 
 
 @dataclass
-class FuturePredictorConfig:
-    predictor: str
-    relabeler: str = "FutureState"
-    relabel_mode: str = "state7"
-
-
-@dataclass
-class FutureTargetEncoderConfig:
-    base_channels: int = 32
-    channel_mults: Tuple[int, ...] = (1, 2)
-    output_dim: int = 128
-
-
-@dataclass
-class VAEFuturePredictorConfig(FuturePredictorConfig):
-    predictor: str = "VAE"
-    # relabeler: str = "FutureState"
-    relabeler: str = "FutureTrajectory"
-    relabel_mode: str = "state7"
-    decimation: int = 2
-    latent_dim: int = 32
-    encoder: FutureTargetEncoderConfig = field(default_factory=FutureTargetEncoderConfig)
-    kl_coef: float = 0.02
-    prior_kl_coef: float = 0.5
-
-
-@dataclass
-class CFMFuturePredictorConfig(FuturePredictorConfig):
-    predictor: str = "CFM"
-    relabeler: str = "FutureTrajectory"
-    relabel_mode: str = "state7"
-    decimation: int = 2
-    unet_base_channels: int = 32
-    unet_channel_mults: Tuple[int, ...] = (1, 2, 4)
-    unet_dropout: float = 0.0
-    trajectory_time_embedding: int = 16
-
-
-@dataclass
 class PPOConfig:
-    _target_: str = f"{__package__}.ppo_it2.PPOPolicy"
+    _target_: str = f"{__package__}.ppo_it2.PPOConfig"
     name: str = "ppo_it2"
     train_every: int = 32
     ppo_epochs: int = 4
@@ -141,33 +95,20 @@ class PPOConfig:
     encoder_lr_scale: float = 0.5
 
     in_keys: Tuple[str, ...] = (
-        CMD_KEY, "secondary_command", "command_mode",
-        OBS_KEY, "extero", "root_state_w"
+        CMD_KEY, "command_mode",
+        OBS_KEY, "extero",
     )
     # Extero: "cnn" = small built-in conv stack; "defm_cnn" = DeFM ResNet/RegNet + BiFPN backbone.
     extero_encoder: str = "cnn" # or "defm_cnn"
     defm_variant: str = "defm_resnet18"  # or "defm_regnet_y_400mf"
     defm_pretrained: bool = True
-    future_pred_minibatches: int = 8
-    future_predictor: FuturePredictorConfig = field(default_factory=VAEFuturePredictorConfig)
-    stages: Tuple[str, ...] = ("policy", "policy_distill", "future")
+
+    def get_class(self):
+        return PPOPolicy
 
 
 cs = ConfigStore.instance()
-cs.store("ppo_it2", node=PPOConfig(stages=("policy",)), group="algo")
-# train policy as well as distill the primary command into the twist command
-cs.store("ppo_it2_distill", node=PPOConfig(stages=("policy_distill",)), group="algo")
-cs.store("ppo_it2_future", node=PPOConfig(stages=("future",)), group="algo")
-cs.store(
-    "ppo_it2_future_vae",
-    node=PPOConfig(stages=("future",), future_predictor=VAEFuturePredictorConfig()),
-    group="algo"
-)
-cs.store(
-    "ppo_it2_future_cfm",
-    node=PPOConfig(stages=("future",), future_predictor=CFMFuturePredictorConfig()),
-    group="algo"
-)
+cs.store("ppo_it2", node=PPOConfig(), group="algo")
 
 class PPOPolicy(TensorDictModuleBase):
 
@@ -181,7 +122,7 @@ class PPOPolicy(TensorDictModuleBase):
         env=None,
     ):
         super().__init__()
-        self.cfg = PPOConfig(**cfg)
+        self.cfg = cfg if isinstance(cfg, PPOConfig) else PPOConfig(**cfg)
         self.device = torch.device(device)
 
         self.entropy_coef = self.cfg.entropy_coef
@@ -205,30 +146,18 @@ class PPOPolicy(TensorDictModuleBase):
             TDMod(self.cnn_norm, ["extero"], ["_extero_normed"]),
         ).to(self.device)
         
-        self.cmd_transform = nn.ModuleDict({
-            "primary_command": env.observation_funcs["primary_command"].symmetry_transform(),
-            "secondary_command": env.observation_funcs["secondary_command"].symmetry_transform()
-        }).to(self.device)
+        self.cmd_transform = env.observation_groups[CMD_KEY].symmetry_transform().to(self.device)
 
-        self.locomotion_relabeler = LocomotionCommand().to(self.device)
-        self.cmd_vecnorms = nn.ModuleDict({
-            "primary_command": VecNorm(cmd_shape, decay=1.0),
-            "secondary_command": self.locomotion_relabeler.vecnorm,
-        }).to(self.device)
+        self.cmd_vecnorm = VecNorm(cmd_shape, decay=1.0).to(self.device)
 
-        self.obs_transform = env.observation_funcs[OBS_KEY].symmetry_transform().to(self.device)
-        self.extero_transform = env.observation_funcs["extero"].symmetry_transform().to(self.device)
-        self.act_transform = env.input_managers[ACTION_KEY].symmetry_transform().to(self.device)
+        self.obs_transform = env.observation_groups[OBS_KEY].symmetry_transform().to(self.device)
+        self.extero_transform = env.observation_groups["extero"].symmetry_transform().to(self.device)
+        self.act_transform = env.action_manager.symmetry_transform().to(self.device)
 
         _actor = nn.Sequential(ResidualFC(self.token_dim, self.token_dim), Actor(self.action_dim))
         _critic = nn.Sequential(ResidualFC(self.token_dim, self.token_dim), Critic(1))
         
-        cmd_encoders = {}
-        # takes in primary command
-        cmd_encoders["primary_command"] = MLP([cmd_shape[-1], self.token_dim], first_non_muon=True)
-        # takes in relabeled twist command
-        cmd_encoders["secondary_command"] = MLP([2 + 2 + 1, self.token_dim], first_non_muon=True) 
-        self.cmd_encoders = nn.ModuleDict(cmd_encoders).to(self.device)
+        self.cmd_encoder = MLP([cmd_shape[-1], self.token_dim], first_non_muon=True).to(self.device)
 
         self.fusion_encoder: nn.Module = EncoderTwo(
             proprio_shape,
@@ -238,45 +167,6 @@ class PPOPolicy(TensorDictModuleBase):
             defm_variant=self.cfg.defm_variant,
             defm_pretrained=self.cfg.defm_pretrained,
         ).to(self.device)
-
-        # construct the relabeler and future predictor
-        # TODO: rename to future_relabeler
-        if self.cfg.future_predictor.relabeler == "FutureTrajectory":
-            self.relabeler = FutureTrajectory(
-                mode=self.cfg.future_predictor.relabel_mode,
-                horizon=self.cfg.train_every,
-                decimation=self.cfg.future_predictor.decimation,
-            )
-        else:
-            self.relabeler = FutureState(
-                mode=self.cfg.future_predictor.relabel_mode,
-                horizon=self.cfg.train_every,
-            )
-        self.relabeler.to(self.device)
-
-        if self.cfg.future_predictor.predictor == "VAE":
-            fp: VAEFuturePredictorConfig = self.cfg.future_predictor
-            self.future_predictor = VAEFuturePredictor(
-                context_dim=self.token_dim,
-                target_shape=self.relabeler.target_shape,
-                latent_dim=fp.latent_dim,
-                kl_coef=fp.kl_coef,
-                encoder_base_channels=fp.encoder.base_channels,
-                encoder_channel_mults=fp.encoder.channel_mults,
-                encoder_output_dim=fp.encoder.output_dim,
-            ).to(self.device)
-        elif self.cfg.future_predictor.predictor == "CFM":
-            fp: CFMFuturePredictorConfig = self.cfg.future_predictor
-            self.future_predictor = CFMFuturePredictor(
-                context_dim=self.token_dim,
-                trajectory_shape=self.relabeler.target_shape,
-                unet_base_channels=fp.unet_base_channels,
-                unet_channel_mults=fp.unet_channel_mults,
-                unet_dropout=fp.unet_dropout,
-                trajectory_time_embedding=fp.trajectory_time_embedding,
-            ).to(self.device)
-        else:
-            raise ValueError(f"Unknown future predictor: {self.cfg.future_predictor.predictor}")
 
         actor_module = TDMod(_actor, ["_shared_feature"], ["loc", "scale"])
         critic_module = TDMod(_critic, ["_shared_feature"], ["state_value"])
@@ -292,7 +182,7 @@ class PPOPolicy(TensorDictModuleBase):
         self.critic = critic_module.to(self.device)
 
         with torch.no_grad():
-            self.run_policy(fake_input, command_keys=("primary_command", "secondary_command"), actor=True, critic=True)
+            self.run_policy(fake_input, actor=True, critic=True)
         
         def init_(module):
             if getattr(module, "_defm_no_reinit", False):
@@ -307,7 +197,7 @@ class PPOPolicy(TensorDictModuleBase):
                 nn.init.orthogonal_(module.actor_mean.weight, 0.01)
                 nn.init.constant_(module.actor_mean.bias, 0.)
         
-        self.cmd_encoders.apply(init_)
+        self.cmd_encoder.apply(init_)
         self.fusion_encoder.apply(init_)
         self.actor.apply(init_)
         self.critic.apply(init_)
@@ -317,77 +207,42 @@ class PPOPolicy(TensorDictModuleBase):
         self._configure_optimizers()
 
         self.update = self._update
-        # if self.cfg.compile and not aa.is_distributed():
-        #     # TODO: compile for multi-gpu training?
-        #     self.update = torch.compile(self.update, fullgraph=True)
-        #     # self.update = CudaGraphModule(self.update)
-        self.prev_tensordict = None
-        self._future_enabled = False
         # Running EMA of return std for scale-invariant value loss normalization.
         # Initialized conservatively at 1.0 so early training uses a larger (not smaller)
         # value gradient — the EMA ramps up to the true scale within the first few rollouts.
         self._ret_std_ema: float = 1.0
 
+    @classmethod
+    def from_env(cls, cfg: PPOConfig, env, device: str):
+        return cls(
+            cfg=cfg,
+            observation_spec=env.observation_spec,
+            action_spec=env.action_spec,
+            reward_spec=env.reward_spec,
+            device=device,
+            env=env,
+        )
+
     def run_policy(
         self,
         tensordict: TensorDict,
         *,
-        command_keys: Tuple[str, ...] = ("primary_command", ), # default to primary-only
-        actor: bool=False,
-        critic: bool=False,
-        future_prediction: bool=False,
+        actor: bool = False,
+        critic: bool = False,
     ) -> TensorDict:
         self.vecnorm(tensordict)
-        queries = []
-        for key in command_keys:
-            if (cmd := tensordict.get(key, None)) is not None:
-                cmd_normed = self.cmd_vecnorms[key](cmd)
-                cmd_query = self.cmd_encoders[key](cmd_normed)
-                queries.append(cmd_query.reshape(*tensordict.shape, 1, self.token_dim))
+        cmd_normed = self.cmd_vecnorm(tensordict[CMD_KEY])
+        cmd_query = self.cmd_encoder(cmd_normed).reshape(*tensordict.shape, 1, self.token_dim)
 
-        num_command_slots = len(queries)
-        if num_command_slots == 0:
-            raise ValueError(
-                f"No command tensors found for command_keys={command_keys!r} "
-                "(keys missing from tensordict or all None)."
-            )
-        queries_cat = torch.cat(queries, dim=-2)
-
-        if future_prediction:
-            num_future_slots = 2
-            future_query = (
-                self.future_predictor
-                .query_embedding(torch.arange(num_future_slots, device=self.device))
-                .expand(*tensordict.shape, num_future_slots, self.token_dim)
-            )
-            queries_cat = torch.cat([queries_cat, future_query], dim=-2)
-            attn_self, attn_cross = build_policy_future_attn_masks(
-                num_command_slots,
-                device=self.device,
-            )
-            feature = self.fusion_encoder.forward(
-                queries_cat,
-                tensordict["_obs_normed"],
-                tensordict["_extero_normed"],
-                attn_mask_self=attn_self,
-                attn_mask_cross=attn_cross,
-            )
-            tensordict["_shared_feature"] = feature[..., :1, :]
-            tensordict["_proprio_context"] = feature[..., num_command_slots, :]
-            tensordict["_extero_context"] = feature[..., num_command_slots + 1, :]
-        else:
-            attn_self, attn_cross = build_policy_attn_masks(
-                num_command_slots,
-                device=self.device,
-            )
-            feature = self.fusion_encoder.forward(
-                queries_cat,
-                tensordict["_obs_normed"],
-                tensordict["_extero_normed"],
-                attn_mask_self=attn_self,
-                attn_mask_cross=attn_cross,
-            )
-            tensordict["_shared_feature"] = feature.squeeze(-2)
+        attn_self, attn_cross = build_policy_attn_masks(1, device=self.device)
+        feature = self.fusion_encoder.forward(
+            cmd_query,
+            tensordict["_obs_normed"],
+            tensordict["_extero_normed"],
+            attn_mask_self=attn_self,
+            attn_mask_cross=attn_cross,
+        )
+        tensordict["_shared_feature"] = feature.squeeze(-2)
         if actor:
             tensordict = self.actor(tensordict)
         if critic:
@@ -396,23 +251,20 @@ class PPOPolicy(TensorDictModuleBase):
     
     def _configure_distributed(self):
         if self.cfg.use_ddp:
-            local_rank = aa.get_local_rank()
+            aa.bind_local_rank_device()
+            local_cuda = aa.get_local_cuda_index()
             self.fusion_encoder = DDP(
                 self.fusion_encoder,
-                device_ids=[local_rank],
+                device_ids=[local_cuda],
                 find_unused_parameters=True,
             )
-            self.cmd_encoders["primary_command"] = DDP(self.cmd_encoders["primary_command"], device_ids=[local_rank])
-            self.cmd_encoders["secondary_command"] = DDP(self.cmd_encoders["secondary_command"], device_ids=[local_rank])
-            self.future_predictor.wrap_DDP(device_ids=[local_rank])
-            self.actor = DDP(self.actor, device_ids=[local_rank])
-            self.critic = DDP(self.critic, device_ids=[local_rank])
+            self.cmd_encoder = DDP(self.cmd_encoder, device_ids=[local_cuda])
+            self.actor = DDP(self.actor, device_ids=[local_cuda])
+            self.critic = DDP(self.critic, device_ids=[local_cuda])
         else:
             for param in self.fusion_encoder.parameters():
                 distr.broadcast(param, src=0)
-            for param in self.cmd_encoders.parameters():
-                distr.broadcast(param, src=0)
-            for param in self.future_predictor.parameters():
+            for param in self.cmd_encoder.parameters():
                 distr.broadcast(param, src=0)
             for param in self.actor.parameters():
                 distr.broadcast(param, src=0)
@@ -425,7 +277,7 @@ class PPOPolicy(TensorDictModuleBase):
         if self.cfg.muon:
             # MuonAdamWWrapper does not support per-group LR; encoder_lr_scale has no effect here.
             self.opt = MuonAdamWWrapper(
-                [self.fusion_encoder, self.cmd_encoders["primary_command"], self.actor, self.critic],
+                [self.fusion_encoder, self.cmd_encoder, self.actor, self.critic],
                 lr=self.cfg.lr,
                 weight_decay=0.01
             )
@@ -434,7 +286,7 @@ class PPOPolicy(TensorDictModuleBase):
                 [
                     # param groups 0-1: encoder (lower LR — deeper shared network)
                     {"params": self.fusion_encoder.parameters(), "lr": encoder_lr},
-                    {"params": self.cmd_encoders["primary_command"].parameters(), "lr": encoder_lr},
+                    {"params": self.cmd_encoder.parameters(), "lr": encoder_lr},
                     # param groups 2-3: actor / critic heads
                     {"params": self.actor.parameters()},
                     {"params": self.critic.parameters()},
@@ -442,22 +294,6 @@ class PPOPolicy(TensorDictModuleBase):
                 lr=self.cfg.lr,
                 weight_decay=0.01
             )
-        # Future prediction uses a separate, smaller LR (VAE-style head; main cfg.lr is for PPO).
-        self.opt_future = torch.optim.AdamW(
-            [
-                {"params": self.future_predictor.parameters()},
-            ],
-            lr=5e-4,
-            weight_decay=0.01,
-        )
-        self.opt_distill = torch.optim.AdamW(
-            [
-                {"params": self.cmd_encoders["secondary_command"].parameters()},
-            ],
-            lr=5e-4,
-            weight_decay=0.01,
-        )
-        # Setup mixed precision training
         if self.cfg.use_amp and self.device.type != "cuda":
             warnings.warn(
                 "PPOConfig.use_amp=True requires a CUDA device; mixed precision disabled.",
@@ -472,34 +308,11 @@ class PPOPolicy(TensorDictModuleBase):
         )
         self._scaler = torch.amp.GradScaler("cuda", enabled=self._amp_enabled)
 
-    def on_stage_start(self, stage: str):
-        self._policy_enabled = (stage in ("policy", "policy_distill"))
-        self._future_enabled = (stage == "future")
-        self._distill_enabled = (stage == "policy_distill")
-        # Reset temporal cache at stage boundaries to avoid cross-stage leakage.
-        self.prev_tensordict = None
+    def on_stage_start(self, stage: str, env=None):
+        pass
 
     def get_rollout_policy(self, mode: str="train", critic: bool=False):
-        if mode == "eval" and self.cfg.stages[0] == "future":
-            def policy(tensordict: TensorDict):
-                self.run_policy(tensordict, actor=True, critic=False, future_prediction=True)
-                pred_0, _, entropy_0 = self.future_predictor.sample_prior(
-                    tensordict["_proprio_context"],
-                    num_samples=3,
-                )
-                pred_1, _, entropy_1 = self.future_predictor.sample_prior(
-                    tensordict["_extero_context"],
-                    num_samples=3,
-                )
-                # print(entropy_0[0], entropy_1[0])
-                # CFM: (N, T, C); VAE (FutureState): (N, 1, C) after multi-sample slice
-                pred_0 = self.relabeler.denormalize(pred_0[:, 0])
-                pred_1 = self.relabeler.denormalize(pred_1[:, 0])
-                tensordict["proprio_pred"] = pred_0[..., :3]  # rel_pos: leading time axes preserved
-                tensordict["extero_pred"] = pred_1[..., :3]
-                return tensordict
-        else:
-            policy = functools.partial(self.run_policy, actor=True, critic=critic)
+        policy = functools.partial(self.run_policy, actor=True, critic=critic)
         if self.cfg.compile:
             policy = torch.compile(policy)
         return policy
@@ -507,104 +320,8 @@ class PPOPolicy(TensorDictModuleBase):
     @VecNorm.freeze()
     def train_op(self, tensordict: TensorDict):
         assert VecNorm.FROZEN, "VecNorm must be frozen before training"
-
-        infos = {}
         tensordict = tensordict.exclude("stats", ("next", "stats"))
-        if not self._future_enabled:
-            infos.update(self.train_policy(tensordict))
-        if self._distill_enabled:
-            infos.update(self.train_distillation(tensordict))
-
-        if (
-            self._future_enabled
-            and self.prev_tensordict is not None
-        ):
-            infos.update(self.train_future_prediction(tensordict))
-        self.prev_tensordict = tensordict.clone()
-
-        return dict(sorted(infos.items()))
-    
-    def train_future_prediction(self, tensordict: TensorDict):
-        self.fusion_encoder.requires_grad_(False) # freeze the fusion encoder
-        
-        with ScopedTimer("future_relabel", sync=False):
-            # concat along the time axis
-            _tensordict = torch.cat([self.prev_tensordict, tensordict], dim=1)
-            _tensordict = self.relabeler.relabel(_tensordict)
-
-        infos = []
-        for minibatch in make_batch(_tensordict, self.cfg.future_pred_minibatches):
-            self.run_policy(minibatch, future_prediction=True)
-            loss, meta = self.future_predictor.compute_loss(
-                minibatch["_proprio_context"],
-                minibatch["_extero_context"],
-                minibatch["_future_target"],
-                valid_mask=minibatch["_future_valid"],
-            )
-            self.opt_future.zero_grad(set_to_none=True)
-            loss.backward()
-            if aa.is_distributed() and not self.cfg.use_ddp:
-                allreduce_grads(self.future_predictor.parameters())
-
-            grad_norm = nn.utils.clip_grad_norm_(self.future_predictor.parameters(), 2.0)
-            self.opt_future.step()
-
-            infos.append({"future/grad_norm": grad_norm, **meta})
-
-        self.fusion_encoder.requires_grad_(True)
-        infos = pytree.tree_map(lambda *xs: sum(xs).item() / len(xs), *infos)
-        infos["future/param_diff"] = check_parameters(self.future_predictor)
-        infos["future/valid_ratio"] = _tensordict["_future_valid"].float().mean().item()
-        return infos
-    
-    def train_distillation(self, tensordict: TensorDict):
-        """Fit the secondary (twist / relabelled) command encoder to the primary path.
-
-        After vecnorm, :meth:`locomotion_relabeler.relabel` writes the twist target into
-        ``secondary_command``. A forward with both command keys builds two fused query
-        rows in ``_shared_feature`` and matching Gaussian means in ``loc``. The primary
-        encoder and fusion module are frozen via ``hold_out_net``; only
-        ``cmd_encoders['secondary_command']`` is stepped (``opt_distill``). Loss is MSE
-        secondary-vs-primary on those queries plus on the actor means—i.e. the primary
-        path acts as a fixed teacher for the relabelled command signal.
-        """
-        self.vecnorm(tensordict)
-        tensordict = self.locomotion_relabeler.relabel(tensordict)
-
-        infos = []
-        with (
-            hold_out_net(self.cmd_encoders["primary_command"]),
-            hold_out_net(self.fusion_encoder)
-        ):
-            for minibatch in make_batch(tensordict, 4):
-                self.run_policy(
-                    minibatch,
-                    command_keys=("primary_command", "secondary_command"),
-                    actor=True,
-                    critic=False,
-                    future_prediction=False,
-                )
-                query_pred = minibatch["_shared_feature"][:, 1, :] # secondary command
-                query_target = minibatch["_shared_feature"][:, 0, :] # primary command
-                action_mean_pred = minibatch["loc"][:, 1, :]
-                action_mean_target = minibatch["loc"][:, 0, :]
-                query_loss = F.mse_loss(query_pred, query_target)
-                action_loss = F.mse_loss(action_mean_pred, action_mean_target)
-                loss = query_loss + action_loss
-                self.opt_distill.zero_grad(set_to_none=True)
-                loss.backward()
-                if aa.is_distributed() and not self.cfg.use_ddp:
-                    allreduce_grads(self.cmd_encoders["secondary_command"].parameters())
-                grad_norm = nn.utils.clip_grad_norm_(self.cmd_encoders["secondary_command"].parameters(), 2.0)
-                self.opt_distill.step()
-
-                infos.append({
-                    "distillation/query_loss": query_loss.detach(),
-                    "distillation/action_loss": action_loss.detach(),
-                    "distillation/grad_norm": grad_norm,
-                })
-        infos = pytree.tree_map(lambda *xs: sum(xs).item() / len(xs), *infos)
-        return infos
+        return self.train_policy(tensordict)
 
     def train_policy(self, tensordict: TensorDict):
         if hasattr(self, "prev_cfg") and self.prev_cfg.muon != self.cfg.muon:
@@ -668,12 +385,11 @@ class PPOPolicy(TensorDictModuleBase):
         infos["critic/ret_std_ema"] = self._ret_std_ema
         infos["critic/neg_rew_ratio"] = (tensordict[REWARD_KEY].sum(-1) <= 0.).float().mean().item()
         if aa.is_distributed():
-            for vn in self.cmd_vecnorms.values():
-                vn.synchronize(mode="broadcast")
+            self.cmd_vecnorm.synchronize(mode="broadcast")
             self.mlp_norm.synchronize(mode="broadcast")
             self.cnn_norm.synchronize(mode="broadcast")
             infos["encoder/diff"] = check_parameters(self.fusion_encoder)
-        return infos
+        return dict(sorted(infos.items()))
 
     @torch.no_grad()
     def _compute_advantage(
@@ -706,9 +422,7 @@ class PPOPolicy(TensorDictModuleBase):
         symmetry = tensordict.empty()
         symmetry[ACTION_KEY] = self.act_transform(tensordict[ACTION_KEY])
         symmetry[OBS_KEY] = self.obs_transform(tensordict[OBS_KEY])
-        for key in ("primary_command", "secondary_command"):
-            if (cmd := tensordict.get(key)) is not None:
-                symmetry[key] = self.cmd_transform[key](cmd)
+        symmetry[CMD_KEY] = self.cmd_transform(tensordict[CMD_KEY])
         symmetry["command_mode"] = tensordict["command_mode"]
         symmetry["extero"] = self.extero_transform(tensordict["extero"])
         symmetry["action_log_prob"] = tensordict["action_log_prob"]
@@ -752,10 +466,6 @@ class PPOPolicy(TensorDictModuleBase):
             values = tensordict["state_value"]
             value_loss_raw = self.critic_loss_fn(values, value_targets)
             value_loss_raw = (value_loss_raw.reshape_as(valid) * valid).sum() / valid_cnt
-            # Scale-invariant value loss: divide by the EMA of return std^2 so the encoder
-            # gradient stays bounded as cumulative returns grow over training.
-            # The EMA was updated once for this rollout (in train_policy) and is shared
-            # across all minibatch steps — consistent normalization within the PPO epoch loop.
             ret_std_ema = max(self._ret_std_ema, 1.0)
             value_loss = self.cfg.value_loss_coef * value_loss_raw / ret_std_ema ** 2
 
@@ -769,13 +479,13 @@ class PPOPolicy(TensorDictModuleBase):
             loss.backward()
 
         if aa.is_distributed() and not self.cfg.use_ddp:
-            allreduce_grads(self.cmd_encoders["primary_command"].parameters())
+            allreduce_grads(self.cmd_encoder.parameters())
             allreduce_grads(self.fusion_encoder.parameters())
             allreduce_grads(self.actor.parameters())
             allreduce_grads(self.critic.parameters())
 
         encoder_grad_norm = nn.utils.clip_grad_norm_(self.fusion_encoder.parameters(), self.max_grad_norm)
-        cmd_encoder_grad_norm = nn.utils.clip_grad_norm_(self.cmd_encoders["primary_command"].parameters(), self.max_grad_norm)
+        cmd_encoder_grad_norm = nn.utils.clip_grad_norm_(self.cmd_encoder.parameters(), self.max_grad_norm)
         actor_grad_norm = nn.utils.clip_grad_norm_(self.actor.parameters(), self.max_grad_norm)
         critic_grad_norm = nn.utils.clip_grad_norm_(self.critic.parameters(), self.max_grad_norm)
 
@@ -807,12 +517,6 @@ class PPOPolicy(TensorDictModuleBase):
     def state_dict(self):
         state_dict = OrderedDict()
         for name, module in self.named_children():
-            if name == "cmd_encoders":
-                state_dict[name] = OrderedDict(
-                    (key, module_.module.state_dict() if isinstance(module_, DDP) else module_.state_dict())
-                    for key, module_ in module.items()
-                )
-                continue
             if isinstance(module, DDP):
                 module = module.module
             state_dict[name] = module.state_dict()
@@ -826,13 +530,6 @@ class PPOPolicy(TensorDictModuleBase):
         for name, module in self.named_children():
             _state_dict = state_dict.get(name, {})
             try:
-                if name == "cmd_encoders":
-                    for key, module_ in module.items():
-                        if isinstance(module_, DDP):
-                            module_ = module_.module
-                        module_.load_state_dict(_state_dict.get(key, {}), strict=strict)
-                    succeed_keys.append(name)
-                    continue
                 if isinstance(module, DDP):
                     module = module.module
                 module.load_state_dict(_state_dict, strict=strict)
@@ -863,4 +560,3 @@ def allreduce_grads(params):
             continue
         distr.all_reduce(param.grad, op=distr.ReduceOp.SUM)
         param.grad /= aa.get_world_size()
-

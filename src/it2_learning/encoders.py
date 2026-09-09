@@ -10,6 +10,45 @@ from torch.nn.attention import SDPBackend, sdpa_kernel
 ExteroEncoderKind = Literal["cnn", "defm_cnn"]
 DefmCnnVariant = Literal["defm_resnet18", "defm_regnet_y_400mf"]
 
+# After the stride-2 stem, AdaptiveAvgPool2d reduces the map to this grid (4 tokens).
+CNN_EXTERO_SPATIAL_HW: tuple[int, int] = (2, 2)
+
+_SDPA_ALIASES = {
+    "efficient": "mem_efficient",
+    "memory_efficient": "mem_efficient",
+}
+
+
+def resolve_sdpa_backends(name: str) -> list[SDPBackend]:
+    """Map a Hydra string to a :func:`sdpa_kernel` backend list. Validated at runtime (no Literal)."""
+    key = str(name).lower().replace("-", "_")
+    key = _SDPA_ALIASES.get(key, key)
+    flash = SDPBackend.FLASH_ATTENTION
+    efficient = SDPBackend.EFFICIENT_ATTENTION
+    math = SDPBackend.MATH
+    cudnn = getattr(SDPBackend, "CUDNN_ATTENTION", None)
+    mapping = {
+        "math": [math],
+        "mem_efficient": [efficient],
+        "flash": [flash],
+        "auto": [flash, efficient, math],
+    }
+    if cudnn is not None:
+        mapping["cudnn"] = [cudnn]
+        mapping["auto"] = [flash, efficient, cudnn, math]
+    if key not in mapping:
+        raise ValueError(
+            f"sdpa_backend must be one of {sorted(mapping)}, got {name!r}"
+        )
+    return mapping[key]
+
+
+def _attn_mask_or_none(mask: torch.Tensor | None) -> torch.Tensor | None:
+    """Flash / mem-efficient kernels reject some explicit masks; all-False is a no-op."""
+    if mask is None or not mask.any():
+        return None
+    return mask
+
 
 def _conv_out_hw(height: int, width: int, *, stride: int = 2, padding: int = 1, kernel: int = 3) -> tuple[int, int]:
     """Spatial size after one Conv2d (matches PyTorch ``floor`` output formula)."""
@@ -121,7 +160,8 @@ def simple_extero_encoder(
     token_dim: int,
     activation: Type[nn.Module],
 ) -> nn.Sequential:
-    """Stride-2 conv stem → ``(N, token_dim, H', W')`` spatial tokens (no global pool)."""
+    """Stride-2 conv stem → AdaptiveAvgPool2d(2×2) → ``(N, token_dim, 2, 2)`` (4 tokens)."""
+    gh, gw = CNN_EXTERO_SPATIAL_HW
     return nn.Sequential(
         nn.Conv2d(extero_channels, 32, kernel_size=3, stride=2, padding=1),
         activation(),
@@ -129,6 +169,7 @@ def simple_extero_encoder(
         activation(),
         nn.Conv2d(64, token_dim, kernel_size=3, stride=2, padding=1),
         activation(),
+        nn.AdaptiveAvgPool2d((gh, gw)),
     )
 
 
@@ -220,7 +261,7 @@ class EncoderTwo(nn.Module):
 
     Pipeline:
 
-    1. **Embed** proprio (1 token) and extero (``P`` spatial tokens, or 1 if DeFM);
+    1. **Embed** proprio (1 token) and extero (``P`` tokens: CNN is 2×2=4, DeFM is 1);
        **LN** precomputed query tokens (order: queries → proprio → extero patches).
     2. **Self-attention** over all ``M + 1 + P`` tokens (residual + layer norm + FFN).
     3. **Cross-attention**: query rows attend to proprio and all extero tokens.
@@ -237,13 +278,13 @@ class EncoderTwo(nn.Module):
         extero_encoder: ExteroEncoderKind = "cnn",
         defm_variant: DefmCnnVariant = "defm_resnet18",
         defm_pretrained: bool = True,
+        sdpa_backend: str = "math",
     ):
         super().__init__()
         self.token_dim = token_dim
         self.extero_encoder_kind = extero_encoder
+        self._sdpa_backends = resolve_sdpa_backends(sdpa_backend)
         extero_channels = extero_shape[0] if len(extero_shape) == 3 else 1
-        extero_h = int(extero_shape[-2]) if len(extero_shape) >= 2 else 1
-        extero_w = int(extero_shape[-1]) if len(extero_shape) >= 1 else 1
 
         self.proprio_mlp = MLP([proprio_shape[-1], 256, token_dim], activation=activation, first_non_muon=True)
         self.extero_cnn = build_extero_encoder(
@@ -255,7 +296,7 @@ class EncoderTwo(nn.Module):
             activation=activation,
         )
         if extero_encoder == "cnn":
-            gh, gw = cnn_feature_hw(extero_h, extero_w)
+            gh, gw = CNN_EXTERO_SPATIAL_HW
             self.extero_spatial_hw = (gh, gw)
             self.num_extero_tokens = gh * gw
             self.extero_pos = nn.Parameter(torch.zeros(1, token_dim, gh, gw))
@@ -345,7 +386,11 @@ class EncoderTwo(nn.Module):
             [queries, proprio_feature, extero_feature], dim=1
         )  # [N, M + 1 + P, token_dim]
 
-        with sdpa_kernel(backends=[SDPBackend.MATH]):
+        attn_mask_self = _attn_mask_or_none(attn_mask_self)
+        attn_mask_cross = _attn_mask_or_none(attn_mask_cross)
+        # Weights require the MATH kernel; training uses the configured backend.
+        sdpa_backends = [SDPBackend.MATH] if return_cross_weights else self._sdpa_backends
+        with sdpa_kernel(backends=sdpa_backends):
             sa_out, _ = self.self_attn(
                 tokens,
                 tokens,
@@ -358,7 +403,7 @@ class EncoderTwo(nn.Module):
 
         query_token = tokens[:, :M, :]
         context = tokens[:, M:, :]
-        with sdpa_kernel(backends=[SDPBackend.MATH]):
+        with sdpa_kernel(backends=sdpa_backends):
             cross_out, cross_weights = self.cross_attn(
                 query_token,
                 context,

@@ -104,6 +104,8 @@ class PPOConfig:
     extero_encoder: str = "cnn" # or "defm_cnn"
     defm_variant: str = "defm_resnet18"  # or "defm_regnet_y_400mf"
     defm_pretrained: bool = True
+    # SDPA kernel: math | mem_efficient | flash | cudnn | auto (Flash→efficient→MATH).
+    sdpa_backend: str = "math"
 
     def get_class(self):
         return PPOPolicy
@@ -168,6 +170,7 @@ class PPOPolicy(TensorDictModuleBase):
             extero_encoder=self.cfg.extero_encoder,
             defm_variant=self.cfg.defm_variant,
             defm_pretrained=self.cfg.defm_pretrained,
+            sdpa_backend=self.cfg.sdpa_backend,
         ).to(self.device)
         self.num_extero_tokens = int(self.fusion_encoder.num_extero_tokens)
 
